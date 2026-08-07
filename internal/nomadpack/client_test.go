@@ -21,11 +21,11 @@ func TestClusterArgs(t *testing.T) {
 
 	got := c.clusterArgs()
 	want := []string{
-		"-address=https://nomad.example:4646",
-		"-namespace=prod",
-		"-region=eu-west",
-		"-token=secret-token",
-		"-tls-skip-verify",
+		"--address=https://nomad.example:4646",
+		"--namespace=prod",
+		"--region=eu-west",
+		"--token=secret-token",
+		"--tls-skip-verify",
 	}
 
 	assertEqualArgs(t, got, want)
@@ -41,13 +41,13 @@ func TestClusterArgsEmpty(t *testing.T) {
 
 func TestPackArgs(t *testing.T) {
 	got := packArgs(PackRef{Pack: "authentik", Registry: "homelab", Ref: "v0.3.1"})
-	want := []string{"-registry=homelab", "-ref=v0.3.1"}
+	want := []string{"--registry=homelab", "--ref=v0.3.1"}
 	assertEqualArgs(t, got, want)
 }
 
 func TestPackArgsRefOnly(t *testing.T) {
 	got := packArgs(PackRef{Pack: "authentik", Ref: "v0.3.1"})
-	want := []string{"-ref=v0.3.1"}
+	want := []string{"--ref=v0.3.1"}
 	assertEqualArgs(t, got, want)
 }
 
@@ -68,11 +68,11 @@ func TestDeploymentArgsVarsAreSortedDeterministically(t *testing.T) {
 	second := deploymentArgs(d)
 
 	want := []string{
-		"-name=authentik-prod",
-		"-var-file=vars/authentik.hcl",
-		"-var=admin_email=ops@example.com",
-		"-var=postgres_host=10.0.10.5",
-		"-var=replicas=2",
+		"--name=authentik-prod",
+		"--var-file=vars/authentik.hcl",
+		"--var=admin_email=ops@example.com",
+		"--var=postgres_host=10.0.10.5",
+		"--var=replicas=2",
 	}
 
 	assertEqualArgs(t, first, want)

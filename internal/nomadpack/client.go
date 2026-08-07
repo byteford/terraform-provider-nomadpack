@@ -80,31 +80,31 @@ func (c *Client) binary() string {
 func (c *Client) clusterArgs() []string {
 	var args []string
 	if c.Cluster.Address != "" {
-		args = append(args, "-address="+c.Cluster.Address)
+		args = append(args, "--address="+c.Cluster.Address)
 	}
 	if c.Cluster.Namespace != "" {
-		args = append(args, "-namespace="+c.Cluster.Namespace)
+		args = append(args, "--namespace="+c.Cluster.Namespace)
 	}
 	if c.Cluster.Region != "" {
-		args = append(args, "-region="+c.Cluster.Region)
+		args = append(args, "--region="+c.Cluster.Region)
 	}
 	if c.Cluster.Token != "" {
-		args = append(args, "-token="+c.Cluster.Token)
+		args = append(args, "--token="+c.Cluster.Token)
 	}
 	if c.Cluster.CACert != "" {
-		args = append(args, "-ca-cert="+c.Cluster.CACert)
+		args = append(args, "--ca-cert="+c.Cluster.CACert)
 	}
 	if c.Cluster.ClientCert != "" {
-		args = append(args, "-client-cert="+c.Cluster.ClientCert)
+		args = append(args, "--client-cert="+c.Cluster.ClientCert)
 	}
 	if c.Cluster.ClientKey != "" {
-		args = append(args, "-client-key="+c.Cluster.ClientKey)
+		args = append(args, "--client-key="+c.Cluster.ClientKey)
 	}
 	if c.Cluster.TLSServerName != "" {
-		args = append(args, "-tls-server-name="+c.Cluster.TLSServerName)
+		args = append(args, "--tls-server-name="+c.Cluster.TLSServerName)
 	}
 	if c.Cluster.TLSSkipVerify {
-		args = append(args, "-tls-skip-verify")
+		args = append(args, "--tls-skip-verify")
 	}
 	return args
 }
@@ -112,10 +112,10 @@ func (c *Client) clusterArgs() []string {
 func packArgs(pack PackRef) []string {
 	var args []string
 	if pack.Registry != "" {
-		args = append(args, "-registry="+pack.Registry)
+		args = append(args, "--registry="+pack.Registry)
 	}
 	if pack.Ref != "" {
-		args = append(args, "-ref="+pack.Ref)
+		args = append(args, "--ref="+pack.Ref)
 	}
 	return args
 }
@@ -123,10 +123,10 @@ func packArgs(pack PackRef) []string {
 func deploymentArgs(d Deployment) []string {
 	var args []string
 	if d.Name != "" {
-		args = append(args, "-name="+d.Name)
+		args = append(args, "--name="+d.Name)
 	}
 	for _, f := range d.VarFiles {
-		args = append(args, "-var-file="+f)
+		args = append(args, "--var-file="+f)
 	}
 	// Sorted iteration isn't required for correctness, but keeps the
 	// resulting command line (and thus any logs) deterministic across
@@ -137,7 +137,7 @@ func deploymentArgs(d Deployment) []string {
 	}
 	sortStrings(keys)
 	for _, k := range keys {
-		args = append(args, fmt.Sprintf("-var=%s=%s", k, d.Vars[k]))
+		args = append(args, fmt.Sprintf("--var=%s=%s", k, d.Vars[k]))
 	}
 	return args
 }
@@ -186,7 +186,7 @@ func (c *Client) exec(ctx context.Context, args []string) (*Result, error) {
 // sync, 1 = changes pending. Any other exit code (255, or a documented
 // override via -exit-code-error) is treated as a real error.
 func (c *Client) Plan(ctx context.Context, pack PackRef, d Deployment) (hasChanges bool, diff string, res *Result, err error) {
-	args := []string{"plan", pack.Pack, "-diff"}
+	args := []string{"plan", pack.Pack, "--diff"}
 	args = append(args, packArgs(pack)...)
 	args = append(args, deploymentArgs(d)...)
 	args = append(args, c.clusterArgs()...)
@@ -219,7 +219,7 @@ func (c *Client) Run(ctx context.Context, pack PackRef, d Deployment, detach boo
 	args = append(args, deploymentArgs(d)...)
 	args = append(args, c.clusterArgs()...)
 	if detach {
-		args = append(args, "-detach")
+		args = append(args, "--detach")
 	}
 
 	res, err := c.exec(ctx, args)
@@ -240,7 +240,7 @@ func (c *Client) Destroy(ctx context.Context, pack PackRef, d Deployment, detach
 	args = append(args, deploymentArgs(d)...)
 	args = append(args, c.clusterArgs()...)
 	if detach {
-		args = append(args, "-detach")
+		args = append(args, "--detach")
 	}
 
 	res, err := c.exec(ctx, args)
