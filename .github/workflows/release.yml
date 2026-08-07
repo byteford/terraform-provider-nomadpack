@@ -1,0 +1,63 @@
+name: release
+
+# Triggered by pushing a semver tag, e.g.:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      # --- GPG signing -----------------------------------------------
+      # Required only if you publish to the public Terraform Registry.
+      # For purely private/self-hosted use (filesystem mirror or a dev
+      # override in ~/.terraformrc) you can skip signing entirely — this
+      # workflow does that automatically when GPG_PRIVATE_KEY isn't set.
+      #
+      # To enable signing, add these repo secrets:
+      #   GPG_PRIVATE_KEY  - armored private key (gpg --export-secret-keys --armor)
+      #   PASSPHRASE       - the key's passphrase
+      - name: Check for GPG key
+        id: check_gpg
+        run: |
+          if [ -n "${{ secrets.GPG_PRIVATE_KEY }}" ]; then
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Import GPG key
+        if: steps.check_gpg.outputs.has_key == 'true'
+        id: import_gpg
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PASSPHRASE }}
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          args: >-
+            release --clean
+            ${{ steps.check_gpg.outputs.has_key == 'false' && '--skip=sign' || '' }}
+          version: '~> v2'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}

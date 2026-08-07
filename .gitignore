@@ -1,0 +1,8 @@
+terraform-provider-nomadpack
+terraform-provider-nomadpack_v*
+dist/
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+.DS_Store
