@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-log/tflog"
@@ -218,9 +220,18 @@ func (c *Client) exec(ctx context.Context, args []string) (*Result, error) {
 }
 
 // Plan runs `nomad-pack plan` as a read-only dry run. It never mutates the
-// cluster. hasChanges reflects nomad-pack's own exit-code contract: 0 = in
-// sync, 1 = changes pending. Any other exit code (255, or a documented
-// override via -exit-code-error) is treated as a real error.
+// cluster. hasChanges primarily follows nomad-pack's own exit-code
+// contract (0 = in sync, 1 = changes pending), but a 0 exit is not fully
+// trusted on its own: nomad-pack has a known history of its reported exit
+// code disagreeing with its own printed diff (see
+// https://github.com/hashicorp/nomad-pack/issues/59 for one documented
+// instance of this class of bug). So a 0 exit is cross-checked against
+// Nomad's own scheduler-level change annotations in the diff text (e.g.
+// `(1 in-place update)`) — if the text shows a real change despite exit
+// code 0, that's trusted instead, since silently reporting "nothing will
+// happen" when something will is a far worse failure than an unnecessary
+// warning. Any other exit code (255, or a documented override via
+// -exit-code-error) is treated as a real error.
 func (c *Client) Plan(ctx context.Context, pack PackRef, d Deployment) (hasChanges bool, diff string, res *Result, err error) {
 	args := []string{"plan", pack.Pack, "--diff"}
 	args = append(args, packArgs(pack)...)
@@ -234,7 +245,7 @@ func (c *Client) Plan(ctx context.Context, pack PackRef, d Deployment) (hasChang
 
 	switch res.ExitCode {
 	case planExitNoChanges:
-		return false, res.Stdout, res, nil
+		return diffIndicatesChange(res.Stdout), res.Stdout, res, nil
 	case planExitMakesChanges:
 		return true, res.Stdout, res, nil
 	default:
@@ -243,6 +254,25 @@ func (c *Client) Plan(ctx context.Context, pack PackRef, d Deployment) (hasChang
 			Stdout: res.Stdout, Stderr: res.Stderr,
 		}
 	}
+}
+
+// taskGroupChangeRe matches Nomad's own scheduler-level annotation on a
+// Task Group line in `nomad job plan`-style output, e.g.
+// `Task Group: "prometheus" (1 in-place update)`. This is Nomad's own
+// classification, independent of whatever exit code nomad-pack layers on
+// top of it.
+var taskGroupChangeRe = regexp.MustCompile(`\((\d+)\s+(?:in-place update|destroy update|create update|create/destroy update)\)`)
+
+// diffIndicatesChange reports whether nomad-pack's printed plan output
+// contains any non-zero Nomad scheduler change count, as a safety net
+// against nomad-pack's exit code being wrong.
+func diffIndicatesChange(output string) bool {
+	for _, m := range taskGroupChangeRe.FindAllStringSubmatch(output, -1) {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // Run submits the pack via `nomad-pack run`, creating or updating every job

@@ -86,6 +86,69 @@ func TestDeploymentArgsNoNameNoVars(t *testing.T) {
 	}
 }
 
+func TestPlanExitZeroButDiffShowsRealChange(t *testing.T) {
+	// Real output pattern that surfaced in the wild: nomad-pack exits 0
+	// ("no changes") despite its own printed diff showing a genuine
+	// scheduler-level update. Exit code 0 must not be trusted blindly.
+	output := `Job: "prometheus"
+Task Group: "prometheus" (1 in-place update)
+  Task: "prometheus"
+» Scheduler dry-run:
+- All tasks successfully allocated.
+`
+	c := &Client{BinaryPath: fakeNomadPack(t, 0, output)}
+
+	hasChanges, _, _, err := c.Plan(context.Background(), PackRef{Pack: "monitoring"}, Deployment{Name: "monitoring"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !hasChanges {
+		t.Fatal("expected hasChanges=true despite exit code 0, because the diff text shows a real in-place update")
+	}
+}
+
+func TestPlanExitZeroWithNoChangeIndicatorsStaysFalse(t *testing.T) {
+	// The counterpart: exit 0 with genuinely inert output (e.g. Task
+	// Groups annotated "(0 ignore)" rather than any update count) must
+	// not be flagged as a change just because the regex ran.
+	output := `Job: "prometheus"
+Task Group: "prometheus" (1 ignore)
+`
+	c := &Client{BinaryPath: fakeNomadPack(t, 0, output)}
+
+	hasChanges, _, _, err := c.Plan(context.Background(), PackRef{Pack: "monitoring"}, Deployment{Name: "monitoring"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if hasChanges {
+		t.Fatal("expected hasChanges=false: no in-place/create/destroy update counts present")
+	}
+}
+
+func TestDiffIndicatesChange(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{"in-place update", `Task Group: "x" (1 in-place update)`, true},
+		{"destroy update", `Task Group: "x" (2 destroy update)`, true},
+		{"create update", `Task Group: "x" (1 create update)`, true},
+		{"create/destroy update", `Task Group: "x" (1 create/destroy update)`, true},
+		{"zero count doesn't count", `Task Group: "x" (0 in-place update)`, false},
+		{"ignore only", `Task Group: "x" (3 ignore)`, false},
+		{"empty output", ``, false},
+		{"unrelated text", `Plan succeeded`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := diffIndicatesChange(tt.output); got != tt.want {
+				t.Fatalf("diffIndicatesChange(%q) = %v, want %v", tt.output, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestPlanExitCodes exercises Plan()'s exit-code interpretation against a
 // fake nomad-pack binary (a shell script) so it doesn't need a real Nomad
 // cluster or the actual nomad-pack tool installed. This locks in the
