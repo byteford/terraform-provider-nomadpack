@@ -14,8 +14,6 @@ resource "nomadpack_deployment" "authentik" {
   ]
 }
 
-output "authentik_diff" {
-  # Non-empty after a `terraform refresh` means the deployed jobs drifted
-  # from what the pack would render — usually a manual Nomad UI edit.
-  value = nomadpack_deployment.authentik.diff
-}
+# Pending changes and any drift detected from the deployed jobs show up as
+# a warning in `terraform plan` output rather than as an attribute here —
+# there's no `diff` output to reference.

@@ -65,7 +65,6 @@ type deploymentResourceModel struct {
 	Vars     types.Map    `tfsdk:"vars"`
 	VarFiles types.List   `tfsdk:"var_files"`
 	Detach   types.Bool   `tfsdk:"detach"`
-	Diff     types.String `tfsdk:"diff"`
 }
 
 func (r *DeploymentResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -128,16 +127,6 @@ func (r *DeploymentResource) Schema(_ context.Context, _ resource.SchemaRequest,
 				Optional: true,
 				Description: "Override the provider's run_detach setting for this deployment. " +
 					"When true, Terraform does not wait for the deployment/evaluation to finish.",
-			},
-			"diff": schema.StringAttribute{
-				Computed: true,
-				Description: "Output of `nomad-pack plan -diff` as of the last Read. Empty when the " +
-					"deployed jobs match the pack as currently rendered. A non-empty value here " +
-					"after `terraform refresh` means something changed outside Terraform — most " +
-					"often a manual edit in the Nomad UI — and needs reconciling.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
 			},
 		},
 	}
@@ -206,16 +195,17 @@ func (r *DeploymentResource) detachFor(m deploymentResourceModel) bool {
 // ModifyPlan previews the effect of the pending config against the live
 // cluster, using `nomad-pack plan` targeted at the *new* pack/vars rather
 // than what's currently deployed — so a var change or a pack change shows
-// up in the `diff` attribute during `terraform plan`, before you apply,
-// instead of only ever reflecting drift discovered on the last refresh.
-// Because it runs on every plan regardless of whether config changed, it
-// also catches drift the same way Read does — this effectively supersedes
-// Read's drift check with a fresher one, but Read is left as-is since it's
-// still what runs during `terraform refresh` / `-refresh-only`.
+// up as a plan-time warning before you apply, instead of only ever
+// reflecting drift discovered on the last refresh. The preview isn't
+// persisted anywhere (nothing downstream depends on it, and it's always
+// stale the instant you apply), so it's surfaced as a diagnostic rather
+// than a stored attribute.
 //
-// This is read-only (nomad-pack plan never mutates the cluster) but it
-// does mean every `terraform plan` makes one extra call to nomad-pack
-// beyond the one Read already makes during refresh.
+// If nothing about the target deployment actually differs from state
+// (same pack/registry/ref/name/vars/var_files), this skips querying
+// nomad-pack entirely — Read already checked this exact target moments
+// earlier in the same plan cycle and would have warned about any drift
+// then, so there's nothing new to preview.
 func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	if req.Plan.Raw.IsNull() {
 		return // Destroy: nothing planned to preview against.
@@ -235,8 +225,20 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 	if err != nil {
 		return // Surfaced properly by Create/Update — avoid double-reporting here.
 	}
+	packRef := plan.toPackRef()
 
-	hasChanges, diff, _, err := r.client.Plan(ctx, plan.toPackRef(), dep)
+	if !req.State.Raw.IsNull() {
+		var state deploymentResourceModel
+		if diags := req.State.Get(ctx, &state); !diags.HasError() {
+			if priorDep, err := state.toDeployment(ctx); err == nil {
+				if packRefsEqual(state.toPackRef(), packRef) && deploymentsEqual(priorDep, dep) {
+					return // Identical to what Read just checked — nothing new to preview.
+				}
+			}
+		}
+	}
+
+	hasChanges, diff, _, err := r.client.Plan(ctx, packRef, dep)
 	if err != nil {
 		// Best-effort preview only. Don't fail the whole plan over this —
 		// e.g. a briefly unreachable Nomad cluster shouldn't block
@@ -244,18 +246,49 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 		// apply time if the problem persists.
 		resp.Diagnostics.AddWarning(
 			"Couldn't preview nomad-pack diff",
-			"nomad-pack plan failed while previewing this change; the diff attribute "+
-				"won't reflect pending changes until the next successful apply or refresh. "+
+			"nomad-pack plan failed while previewing this change; no preview is available "+
+				"for this plan, but apply will still surface a real error if the problem persists. "+
 				err.Error(),
 		)
 		return
 	}
 
-	previewDiff := ""
 	if hasChanges {
-		previewDiff = diff
+		resp.Diagnostics.AddWarning(
+			fmt.Sprintf("Pending nomad-pack changes for %q", packRef.Pack),
+			diff,
+		)
 	}
-	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("diff"), types.StringValue(previewDiff))...)
+}
+
+// packRefsEqual and deploymentsEqual back ModifyPlan's shortcut: only
+// re-query nomad-pack when the target deployment genuinely differs from
+// what Read already checked this same plan cycle.
+func packRefsEqual(a, b nomadpack.PackRef) bool {
+	return a.Pack == b.Pack && a.Registry == b.Registry && a.Ref == b.Ref
+}
+
+func deploymentsEqual(a, b nomadpack.Deployment) bool {
+	if a.Name != b.Name {
+		return false
+	}
+	if len(a.VarFiles) != len(b.VarFiles) {
+		return false
+	}
+	for i := range a.VarFiles {
+		if a.VarFiles[i] != b.VarFiles[i] {
+			return false
+		}
+	}
+	if len(a.Vars) != len(b.Vars) {
+		return false
+	}
+	for k, v := range a.Vars {
+		if bv, ok := b.Vars[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *DeploymentResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -287,7 +320,6 @@ func (r *DeploymentResource) Create(ctx context.Context, req resource.CreateRequ
 	tflog.Debug(ctx, "nomad-pack run succeeded", map[string]interface{}{"output": res.Stdout})
 
 	plan.ID = types.StringValue(dep.Name)
-	plan.Diff = types.StringValue("")
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
@@ -328,9 +360,14 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 	}
 
 	if hasChanges {
-		state.Diff = types.StringValue(diff)
-	} else {
-		state.Diff = types.StringValue("")
+		// Deployed jobs no longer match what this resource believes it
+		// deployed — most often a manual edit in the Nomad UI. This is
+		// informational; Terraform's own attribute-level diff already
+		// drives what actually gets changed on the next apply.
+		resp.Diagnostics.AddWarning(
+			fmt.Sprintf("Drift detected for %q", state.Pack.ValueString()),
+			diff,
+		)
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
@@ -357,7 +394,6 @@ func (r *DeploymentResource) Update(ctx context.Context, req resource.UpdateRequ
 	tflog.Debug(ctx, "nomad-pack run succeeded", map[string]interface{}{"output": res.Stdout})
 
 	plan.ID = types.StringValue(dep.Name)
-	plan.Diff = types.StringValue("")
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
