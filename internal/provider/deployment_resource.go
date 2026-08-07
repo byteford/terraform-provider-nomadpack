@@ -84,18 +84,19 @@ func (r *DeploymentResource) Schema(_ context.Context, _ resource.SchemaRequest,
 				},
 			},
 			"pack": schema.StringAttribute{
-				Required:    true,
-				Description: "Pack name (as known to the registry) or a filesystem path to a pack under development.",
+				Required: true,
+				Description: "Pack name (as known to the registry) or a filesystem path to a pack " +
+					"under development. Changing this re-runs `nomad-pack run` under the existing " +
+					"deployment name rather than destroying and recreating — nomad-pack itself " +
+					"handles swapping what a named deployment points to. Equivalent path spellings " +
+					"(absolute vs relative to the same directory) aren't treated as a change at all.",
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+					normalizesEquivalentPaths(),
 				},
 			},
 			"registry": schema.StringAttribute{
 				Optional:    true,
 				Description: "Registry name containing the pack. Omit to use nomad-pack's default registry.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
-				},
 			},
 			"ref": schema.StringAttribute{
 				Optional: true,

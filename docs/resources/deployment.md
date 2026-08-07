@@ -41,7 +41,7 @@ output "authentik_diff" {
 
 ### Required
 
-- `pack` (String) Pack name (as known to the registry) or a filesystem path to a pack under development.
+- `pack` (String) Pack name (as known to the registry) or a filesystem path to a pack under development. Changing this re-runs `nomad-pack run` under the existing deployment name rather than destroying and recreating — nomad-pack itself handles swapping what a named deployment points to. Equivalent path spellings (absolute vs relative to the same directory) aren't treated as a change at all.
 
 ### Optional
 
