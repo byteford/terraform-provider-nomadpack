@@ -14,6 +14,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 )
 
 // Exit codes documented at:
@@ -177,6 +179,11 @@ func sortStrings(s []string) {
 }
 
 func (c *Client) exec(ctx context.Context, args []string) (*Result, error) {
+	tflog.Debug(ctx, "executing nomad-pack", map[string]interface{}{
+		"binary": c.binary(),
+		"args":   redactArgs(args),
+	})
+
 	cmd := exec.CommandContext(ctx, c.binary(), args...)
 	// nomad-pack's output rendering (go-glint) can emit ANSI color codes
 	// if it misdetects a TTY. Force it off so error text stays clean when
@@ -293,6 +300,24 @@ func (c *Client) Destroy(ctx context.Context, pack PackRef, d Deployment, detach
 		}
 	}
 	return res, nil
+}
+
+// redactArgs masks flag values that shouldn't end up in debug logs (which
+// people routinely paste into GitHub issues or CI output) even though
+// they're safe to pass on a local command line.
+func redactArgs(args []string) []string {
+	redacted := make([]string, len(args))
+	for i, a := range args {
+		switch {
+		case strings.HasPrefix(a, "--token="):
+			redacted[i] = "--token=<redacted>"
+		case strings.HasPrefix(a, "--client-key="):
+			redacted[i] = "--client-key=<redacted>"
+		default:
+			redacted[i] = a
+		}
+	}
+	return redacted
 }
 
 func firstNonEmpty(vals ...string) string {
