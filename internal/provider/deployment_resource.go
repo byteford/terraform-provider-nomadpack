@@ -194,12 +194,16 @@ func (r *DeploymentResource) detachFor(m deploymentResourceModel) bool {
 
 // ModifyPlan previews the effect of the pending config against the live
 // cluster, using `nomad-pack plan` targeted at the *new* pack/vars rather
-// than what's currently deployed — so a var change or a pack change shows
-// up as a plan-time warning before you apply, instead of only ever
-// reflecting drift discovered on the last refresh. The preview isn't
-// persisted anywhere (nothing downstream depends on it, and it's always
-// stale the instant you apply), so it's surfaced as a diagnostic rather
-// than a stored attribute.
+// than what's currently deployed. Whenever Terraform is actually about to
+// run Update (the target genuinely differs from state), this states
+// plainly whether the cluster will change or not — as a "Will redeploy" /
+// "Will NOT redeploy" warning — rather than leaving that to be inferred
+// from whether a warning happened to appear. Terraform's own attribute
+// diff (e.g. `vars = {...}`) always shows regardless; this is specifically
+// about whether that attribute change actually reaches the deployed jobs.
+// The preview isn't persisted anywhere (nothing downstream depends on it,
+// and it's always stale the instant you apply), so it's surfaced as a
+// diagnostic rather than a stored attribute.
 //
 // If nothing about the target deployment actually differs from state
 // (same pack/registry/ref/name/vars/var_files), this skips querying
@@ -253,10 +257,23 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 		return
 	}
 
+	// Reaching here means Terraform is about to run Update (dep differed
+	// from state, or this is a brand-new resource) — so this is exactly
+	// the moment to say plainly whether the cluster will actually change,
+	// rather than leaving the answer to be inferred from whether a
+	// warning showed up at all.
 	if hasChanges {
 		resp.Diagnostics.AddWarning(
-			fmt.Sprintf("Pending nomad-pack changes for %q", packRef.Pack),
+			fmt.Sprintf("Will redeploy: %q", packRef.Pack),
 			diff,
+		)
+	} else {
+		resp.Diagnostics.AddWarning(
+			fmt.Sprintf("Will NOT redeploy: %q", packRef.Pack),
+			"This change doesn't alter what nomad-pack renders for any job in this pack — "+
+				"nomad-pack run will still execute (refreshing its own tracking metadata) but "+
+				"nothing on the cluster will actually change. If a var was expected to affect "+
+				"the job, check that the pack's templates actually reference it.",
 		)
 	}
 }
