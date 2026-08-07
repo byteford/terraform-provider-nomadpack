@@ -310,11 +310,41 @@ func (r *DeploymentResource) Delete(ctx context.Context, req resource.DeleteRequ
 	}
 }
 
-// ImportState only recovers the name/id. pack, registry, and ref can't be
-// reconstructed from the cluster (nomad-pack's job meta doesn't retain the
-// registry name or the exact ref used), so a subsequent `terraform plan`
-// will show those as needing to be set — fill them in from your pack
-// source before importing.
+// ImportState expects an import ID of the form "<pack>:<registry>:<ref>:<name>"
+// (leave registry/ref empty between colons if unset), e.g.
+// "authentik::v0.3.1:authentik-prod". A bare deployment name isn't enough:
+// nomad-pack's plan/run/destroy commands are keyed by pack, not by
+// deployment name alone, so Read (which this provider calls automatically
+// right after import to fill in the rest of state) needs pack to already
+// be known before it can query anything.
 func (r *DeploymentResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
+	parts := strings.Split(req.ID, ":")
+	if len(parts) != 4 {
+		resp.Diagnostics.AddError(
+			"Unexpected Import Identifier",
+			`Expected an import ID of the form "<pack>:<registry>:<ref>:<name>" `+
+				`(leave registry/ref empty between the colons if unset), e.g. `+
+				`"authentik::v0.3.1:authentik-prod". Got: "`+req.ID+`".`,
+		)
+		return
+	}
+
+	pack, registry, ref, name := parts[0], parts[1], parts[2], parts[3]
+	if pack == "" || name == "" {
+		resp.Diagnostics.AddError(
+			"Unexpected Import Identifier",
+			"Both <pack> and <name> are required (registry and ref may be left empty).",
+		)
+		return
+	}
+
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), name)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("name"), name)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("pack"), pack)...)
+	if registry != "" {
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("registry"), registry)...)
+	}
+	if ref != "" {
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("ref"), ref)...)
+	}
 }

@@ -56,3 +56,22 @@ output "authentik_diff" {
 
 - `diff` (String) Output of `nomad-pack plan -diff` as of the last Read. Empty when the deployed jobs match the pack as currently rendered. A non-empty value here after `terraform refresh` means something changed outside Terraform — most often a manual edit in the Nomad UI — and needs reconciling.
 - `id` (String) Same as `name`. Present for Terraform resource identity conventions.
+
+## Import
+
+Import is supported using the following syntax:
+
+The [`terraform import` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
+
+```shell
+# Import uses a composite ID: "<pack>:<registry>:<ref>:<name>"
+# Leave registry/ref empty between the colons if you don't use them —
+# a bare deployment name isn't enough, since nomad-pack's plan/run/destroy
+# commands are keyed by pack, not by deployment name alone.
+#
+# vars and var_files can't be recovered from the cluster and will show as
+# needing to be set on the first `terraform plan` after import — fill
+# those in from your pack source to match the existing deployment.
+
+terraform import nomadpack_deployment.authentik "authentik::v0.3.1:authentik-prod"
+```
