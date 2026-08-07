@@ -14,7 +14,6 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-log/tflog"
@@ -226,12 +225,19 @@ func (c *Client) exec(ctx context.Context, args []string) (*Result, error) {
 // code disagreeing with its own printed diff (see
 // https://github.com/hashicorp/nomad-pack/issues/59 for one documented
 // instance of this class of bug). So a 0 exit is cross-checked against
-// Nomad's own scheduler-level change annotations in the diff text (e.g.
-// `(1 in-place update)`) — if the text shows a real change despite exit
-// code 0, that's trusted instead, since silently reporting "nothing will
-// happen" when something will is a far worse failure than an unnecessary
-// warning. Any other exit code (255, or a documented override via
-// -exit-code-error) is treated as a real error.
+// the diff text — specifically, whether nomad-pack marked any individual
+// job's "Job:" line with a `+`/`-`/`+/-` change prefix, which is nomad's
+// own per-job diff verdict. That's a deliberately narrower signal than
+// "any Task Group shows an in-place update count": in practice nomad-pack
+// reports a routine in-place-update count for essentially every job on
+// essentially every plan (observed to correlate with its own injected
+// metadata churning, e.g. a timestamp field, independent of whether the
+// job's actual spec changed) — so treating that count alone as "a change"
+// produces constant false positives. The `+/-` prefix on the Job line
+// itself doesn't. The returned diff is also trimmed to only the job
+// blocks nomad-pack actually marked as changed, dropping the unmarked
+// (routine, uninformative) job blocks so warnings shown to the user
+// aren't a wall of unrelated boilerplate.
 func (c *Client) Plan(ctx context.Context, pack PackRef, d Deployment) (hasChanges bool, diff string, res *Result, err error) {
 	args := []string{"plan", pack.Pack, "--diff"}
 	args = append(args, packArgs(pack)...)
@@ -243,10 +249,22 @@ func (c *Client) Plan(ctx context.Context, pack PackRef, d Deployment) (hasChang
 		return false, "", res, err
 	}
 
+	changedBlocks, anyChanged := filterChangedJobBlocks(res.Stdout)
+
 	switch res.ExitCode {
 	case planExitNoChanges:
-		return diffIndicatesChange(res.Stdout), res.Stdout, res, nil
+		if anyChanged {
+			return true, changedBlocks, res, nil
+		}
+		return false, res.Stdout, res, nil
 	case planExitMakesChanges:
+		if anyChanged {
+			return true, changedBlocks, res, nil
+		}
+		// Exit code says changes are pending but no job's "Job:" line was
+		// marked — output format didn't match what was expected (e.g. a
+		// future nomad-pack version). Fall back to the full raw text
+		// rather than silently showing nothing.
 		return true, res.Stdout, res, nil
 	default:
 		return false, res.Stdout, res, &CLIError{
@@ -256,23 +274,49 @@ func (c *Client) Plan(ctx context.Context, pack PackRef, d Deployment) (hasChang
 	}
 }
 
-// taskGroupChangeRe matches Nomad's own scheduler-level annotation on a
-// Task Group line in `nomad job plan`-style output, e.g.
-// `Task Group: "prometheus" (1 in-place update)`. This is Nomad's own
-// classification, independent of whatever exit code nomad-pack layers on
-// top of it.
-var taskGroupChangeRe = regexp.MustCompile(`\((\d+)\s+(?:in-place update|destroy update|create update|create/destroy update)\)`)
+// jobHeaderRe matches a `Job:` line in nomad-pack's plan output, capturing
+// an optional leading `+`, `-`, or `+/-` change marker. nomad-pack applies
+// this marker to the top-level Job line whenever anything nested under it
+// differs — the same convention `nomad job plan` itself uses — making it a
+// more precise "did this job actually change" signal than any per-Task-
+// Group annotation.
+var jobHeaderRe = regexp.MustCompile(`(\+/-|\+|-)?\s*Job:\s*"([^"]*)"`)
 
-// diffIndicatesChange reports whether nomad-pack's printed plan output
-// contains any non-zero Nomad scheduler change count, as a safety net
-// against nomad-pack's exit code being wrong.
-func diffIndicatesChange(output string) bool {
-	for _, m := range taskGroupChangeRe.FindAllStringSubmatch(output, -1) {
-		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
-			return true
-		}
+// filterChangedJobBlocks splits nomad-pack's plan output into per-job
+// blocks and keeps only the ones for jobs nomad-pack actually marked
+// changed. nomad-pack sometimes concatenates consecutive jobs' output
+// with no separating newline at all (observed in practice as e.g.
+// `...potentially invalid.Job: "alloy"...`), so blocks are found by
+// scanning for `Job:` occurrences directly rather than splitting on
+// lines.
+func filterChangedJobBlocks(output string) (changed string, anyChanged bool) {
+	matches := jobHeaderRe.FindAllStringSubmatchIndex(output, -1)
+	if len(matches) == 0 {
+		return "", false
 	}
-	return false
+
+	var kept []string
+	for i, m := range matches {
+		start := m[0]
+		end := len(output)
+		if i+1 < len(matches) {
+			end = matches[i+1][0]
+		}
+
+		marker := ""
+		if m[2] != -1 {
+			marker = output[m[2]:m[3]]
+		}
+		if marker == "" {
+			continue // Unmarked job block — routine churn, not a real change.
+		}
+		kept = append(kept, strings.TrimSpace(output[start:end]))
+	}
+
+	if len(kept) == 0 {
+		return "", false
+	}
+	return strings.Join(kept, "\n\n"), true
 }
 
 // Run submits the pack via `nomad-pack run`, creating or updating every job

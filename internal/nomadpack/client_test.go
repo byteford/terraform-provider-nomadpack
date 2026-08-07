@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -88,11 +89,53 @@ func TestDeploymentArgsNoNameNoVars(t *testing.T) {
 
 func TestPlanExitZeroButDiffShowsRealChange(t *testing.T) {
 	// Real output pattern that surfaced in the wild: nomad-pack exits 0
-	// ("no changes") despite its own printed diff showing a genuine
-	// scheduler-level update. Exit code 0 must not be trusted blindly.
-	output := `Job: "prometheus"
-Task Group: "prometheus" (1 in-place update)
-  Task: "prometheus"
+	// ("no changes") despite marking one job's "Job:" line as changed.
+	// Exit code 0 must not be trusted blindly.
+	output := `+/- Job: "prometheus"
++/- Task Group: "prometheus" (1 in-place update)
+  +/- Service {
+      Name: "prometheus"
+    +/- Tags {
+      + Tags: "traefik.http.routers.prometheus.rule=Host(` + "`prometheus.sandford.hous`" + `)"
+      - Tags: "traefik.http.routers.prometheus.rule=Host(` + "`prometheus.sandford.house`" + `)"
+      }
+    }
+`
+	c := &Client{BinaryPath: fakeNomadPack(t, 0, output)}
+
+	hasChanges, diff, _, err := c.Plan(context.Background(), PackRef{Pack: "monitoring"}, Deployment{Name: "monitoring"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !hasChanges {
+		t.Fatal("expected hasChanges=true despite exit code 0, because the Job line is marked +/-")
+	}
+	if !strings.Contains(diff, "prometheus.sandford.hous") {
+		t.Fatalf("expected the trimmed diff to include the real change, got: %q", diff)
+	}
+}
+
+func TestPlanRoutineChurnAcrossManyJobsStaysFalse(t *testing.T) {
+	// The exact regression this guards against: multiple jobs each show a
+	// bare "(N in-place update)" Task Group annotation with no +/- marker
+	// on the Job line itself and no nested diff content — nomad-pack's
+	// routine per-plan churn (observed correlating with its own injected
+	// metadata), not a real change. None of these should count.
+	output := `Job: "alloy"
+Task Group: "alloy" (2 in-place update)
+  Task: "alloy"
+» Scheduler dry-run:
+- All tasks successfully allocated.
+To submit the job with version verification run:
+nomad-pack run monitoring --check-index=6881775 [options]
+Job: "grafana"
+Task Group: "grafana" (1 in-place update)
+  Task: "grafana"
+» Scheduler dry-run:
+- All tasks successfully allocated.
+Job: "loki"
+Task Group: "loki" (1 in-place update)
+  Task: "loki"
 » Scheduler dry-run:
 - All tasks successfully allocated.
 `
@@ -102,50 +145,65 @@ Task Group: "prometheus" (1 in-place update)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !hasChanges {
-		t.Fatal("expected hasChanges=true despite exit code 0, because the diff text shows a real in-place update")
-	}
-}
-
-func TestPlanExitZeroWithNoChangeIndicatorsStaysFalse(t *testing.T) {
-	// The counterpart: exit 0 with genuinely inert output (e.g. Task
-	// Groups annotated "(0 ignore)" rather than any update count) must
-	// not be flagged as a change just because the regex ran.
-	output := `Job: "prometheus"
-Task Group: "prometheus" (1 ignore)
-`
-	c := &Client{BinaryPath: fakeNomadPack(t, 0, output)}
-
-	hasChanges, _, _, err := c.Plan(context.Background(), PackRef{Pack: "monitoring"}, Deployment{Name: "monitoring"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
 	if hasChanges {
-		t.Fatal("expected hasChanges=false: no in-place/create/destroy update counts present")
+		t.Fatal("expected hasChanges=false: no job's \"Job:\" line carries a +/-/+/- change marker")
 	}
 }
 
-func TestDiffIndicatesChange(t *testing.T) {
-	tests := []struct {
-		name   string
-		output string
-		want   bool
-	}{
-		{"in-place update", `Task Group: "x" (1 in-place update)`, true},
-		{"destroy update", `Task Group: "x" (2 destroy update)`, true},
-		{"create update", `Task Group: "x" (1 create update)`, true},
-		{"create/destroy update", `Task Group: "x" (1 create/destroy update)`, true},
-		{"zero count doesn't count", `Task Group: "x" (0 in-place update)`, false},
-		{"ignore only", `Task Group: "x" (3 ignore)`, false},
-		{"empty output", ``, false},
-		{"unrelated text", `Plan succeeded`, false},
+func TestFilterChangedJobBlocksDropsUnmarkedJobsAndKeepsMarkedOnes(t *testing.T) {
+	// Modeled directly on real nomad-pack output for a 4-job pack where
+	// only one job (prometheus) actually changed — including nomad-pack's
+	// own quirk of concatenating job blocks with no separating newline
+	// (".Job:" with no newline between them).
+	output := `Job: "alloy"
+Task Group: "alloy" (2 in-place update)
+» Scheduler dry-run:
+- All tasks successfully allocated.
+To submit the job with version verification run:
+nomad-pack run monitoring --check-index=6881775 [options]
+potentially invalid.Job: "grafana"
+Task Group: "grafana" (1 in-place update)
+» Scheduler dry-run:
+- All tasks successfully allocated.
+potentially invalid.+/- Job: "prometheus"
++/- Task Group: "prometheus" (1 in-place update)
+  +/- Service {
+    + Tags: "traefik...prometheus.sandford.hous"
+    - Tags: "traefik...prometheus.sandford.house"
+    }
+potentially invalid.Job: "loki"
+Task Group: "loki" (1 in-place update)
+» Scheduler dry-run:
+- All tasks successfully allocated.
+`
+	changed, anyChanged := filterChangedJobBlocks(output)
+	if !anyChanged {
+		t.Fatal("expected anyChanged=true: prometheus is marked +/-")
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := diffIndicatesChange(tt.output); got != tt.want {
-				t.Fatalf("diffIndicatesChange(%q) = %v, want %v", tt.output, got, tt.want)
-			}
-		})
+	if strings.Contains(changed, `Job: "alloy"`) || strings.Contains(changed, `Job: "grafana"`) || strings.Contains(changed, `Job: "loki"`) {
+		t.Fatalf("expected unmarked job blocks to be dropped, got: %q", changed)
+	}
+	if !strings.Contains(changed, `+/- Job: "prometheus"`) {
+		t.Fatalf("expected the marked prometheus block to be kept, got: %q", changed)
+	}
+}
+
+func TestFilterChangedJobBlocksNoMarkedJobs(t *testing.T) {
+	changed, anyChanged := filterChangedJobBlocks(`Job: "x"
+Task Group: "x" (1 in-place update)
+`)
+	if anyChanged {
+		t.Fatalf("expected anyChanged=false, got true with changed=%q", changed)
+	}
+	if changed != "" {
+		t.Fatalf("expected empty changed text, got %q", changed)
+	}
+}
+
+func TestFilterChangedJobBlocksNoJobsAtAll(t *testing.T) {
+	changed, anyChanged := filterChangedJobBlocks("Plan succeeded")
+	if anyChanged || changed != "" {
+		t.Fatalf("expected no change detected on text with no Job: lines, got changed=%q anyChanged=%v", changed, anyChanged)
 	}
 }
 
