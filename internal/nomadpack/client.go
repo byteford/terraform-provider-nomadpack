@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -22,6 +23,30 @@ const (
 	planExitMakesChanges = 1
 	planExitError        = 255
 )
+
+// CLIError is returned whenever a nomad-pack invocation exits non-zero (or,
+// for Plan, with an unexpected exit code). It carries the raw captured
+// output so callers can decide how to present it, instead of every call
+// site re-formatting stdout/stderr by hand — which previously led to the
+// same message being shown to the user two or three times over.
+type CLIError struct {
+	Op       string // "plan", "run", or "destroy"
+	Args     []string
+	ExitCode int
+	Stdout   string
+	Stderr   string
+}
+
+func (e *CLIError) Error() string {
+	return fmt.Sprintf("nomad-pack %s exited %d: %s", e.Op, e.ExitCode, e.Output())
+}
+
+// Output returns the single most relevant captured stream for display.
+// nomad-pack often writes its formatted error boxes to stdout rather than
+// stderr, so stderr only wins here when it actually has content.
+func (e *CLIError) Output() string {
+	return strings.TrimSpace(firstNonEmpty(e.Stderr, e.Stdout))
+}
 
 // ClusterConfig holds Nomad connection details shared by every nomad-pack
 // invocation. Empty fields are omitted from the command line, letting
@@ -153,6 +178,10 @@ func sortStrings(s []string) {
 
 func (c *Client) exec(ctx context.Context, args []string) (*Result, error) {
 	cmd := exec.CommandContext(ctx, c.binary(), args...)
+	// nomad-pack's output rendering (go-glint) can emit ANSI color codes
+	// if it misdetects a TTY. Force it off so error text stays clean when
+	// surfaced through Terraform diagnostics.
+	cmd.Env = append(os.Environ(), "NO_COLOR=1")
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -202,10 +231,10 @@ func (c *Client) Plan(ctx context.Context, pack PackRef, d Deployment) (hasChang
 	case planExitMakesChanges:
 		return true, res.Stdout, res, nil
 	default:
-		return false, res.Stdout, res, fmt.Errorf(
-			"nomad-pack plan exited %d: %s",
-			res.ExitCode, firstNonEmpty(res.Stderr, res.Stdout),
-		)
+		return false, res.Stdout, res, &CLIError{
+			Op: "plan", Args: args, ExitCode: res.ExitCode,
+			Stdout: res.Stdout, Stderr: res.Stderr,
+		}
 	}
 }
 
@@ -227,7 +256,10 @@ func (c *Client) Run(ctx context.Context, pack PackRef, d Deployment, detach boo
 		return res, err
 	}
 	if res.ExitCode != 0 {
-		return res, fmt.Errorf("nomad-pack run exited %d: %s", res.ExitCode, firstNonEmpty(res.Stderr, res.Stdout))
+		return res, &CLIError{
+			Op: "run", Args: args, ExitCode: res.ExitCode,
+			Stdout: res.Stdout, Stderr: res.Stderr,
+		}
 	}
 	return res, nil
 }
@@ -255,7 +287,10 @@ func (c *Client) Destroy(ctx context.Context, pack PackRef, d Deployment, detach
 			strings.Contains(strings.ToLower(res.Stdout), "not found") {
 			return res, nil
 		}
-		return res, fmt.Errorf("nomad-pack destroy exited %d: %s", res.ExitCode, firstNonEmpty(res.Stderr, res.Stdout))
+		return res, &CLIError{
+			Op: "destroy", Args: args, ExitCode: res.ExitCode,
+			Stdout: res.Stdout, Stderr: res.Stderr,
+		}
 	}
 	return res, nil
 }

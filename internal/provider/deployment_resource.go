@@ -2,9 +2,11 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -15,6 +17,23 @@ import (
 
 	"github.com/byteford/terraform-provider-nomadpack/internal/nomadpack"
 )
+
+// addCLIError renders a nomad-pack failure as a single, non-duplicated
+// diagnostic. For a *nomadpack.CLIError it shows the one most relevant
+// captured stream (stderr if nomad-pack wrote one, else stdout) exactly
+// once; for anything else (e.g. the binary wasn't found at all) it falls
+// back to the plain error text.
+func addCLIError(diags *diag.Diagnostics, summary string, err error) {
+	var cliErr *nomadpack.CLIError
+	if errors.As(err, &cliErr) {
+		diags.AddError(
+			fmt.Sprintf("%s (nomad-pack %s exited %d)", summary, cliErr.Op, cliErr.ExitCode),
+			cliErr.Output(),
+		)
+		return
+	}
+	diags.AddError(summary, err.Error())
+}
 
 var (
 	_ resource.Resource                = &DeploymentResource{}
@@ -202,12 +221,10 @@ func (r *DeploymentResource) Create(ctx context.Context, req resource.CreateRequ
 
 	res, err := r.client.Run(ctx, plan.toPackRef(), dep, r.detachFor(plan))
 	if err != nil {
-		resp.Diagnostics.AddError(
-			"nomad-pack run failed",
-			fmt.Sprintf("%s\n\nstdout:\n%s\n\nstderr:\n%s", err, res.Stdout, res.Stderr),
-		)
+		addCLIError(&resp.Diagnostics, "nomad-pack run failed", err)
 		return
 	}
+	tflog.Debug(ctx, "nomad-pack run succeeded", map[string]interface{}{"output": res.Stdout})
 
 	plan.ID = types.StringValue(dep.Name)
 	plan.Diff = types.StringValue("")
@@ -228,7 +245,7 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 		return
 	}
 
-	hasChanges, diff, res, err := r.client.Plan(ctx, state.toPackRef(), dep)
+	hasChanges, diff, _, err := r.client.Plan(ctx, state.toPackRef(), dep)
 	if err != nil {
 		// nomad-pack doesn't document a distinct "no such deployment"
 		// exit code (see the 255 catch-all in the plan command docs),
@@ -236,17 +253,17 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 		// doesn't match your nomad-pack version's phrasing, Read will
 		// surface the plan error instead of removing the resource,
 		// which is the safer failure mode.
-		combined := strings.ToLower(res.Stdout + res.Stderr)
-		if strings.Contains(combined, "no jobs found") ||
-			strings.Contains(combined, "not found") ||
-			strings.Contains(combined, "does not exist") {
-			resp.State.RemoveResource(ctx)
-			return
+		var cliErr *nomadpack.CLIError
+		if errors.As(err, &cliErr) {
+			combined := strings.ToLower(cliErr.Output())
+			if strings.Contains(combined, "no jobs found") ||
+				strings.Contains(combined, "not found") ||
+				strings.Contains(combined, "does not exist") {
+				resp.State.RemoveResource(ctx)
+				return
+			}
 		}
-		resp.Diagnostics.AddError(
-			"nomad-pack plan failed",
-			fmt.Sprintf("%s\n\nstdout:\n%s\n\nstderr:\n%s", err, res.Stdout, res.Stderr),
-		)
+		addCLIError(&resp.Diagnostics, "nomad-pack plan failed", err)
 		return
 	}
 
@@ -274,12 +291,10 @@ func (r *DeploymentResource) Update(ctx context.Context, req resource.UpdateRequ
 
 	res, err := r.client.Run(ctx, plan.toPackRef(), dep, r.detachFor(plan))
 	if err != nil {
-		resp.Diagnostics.AddError(
-			"nomad-pack run failed",
-			fmt.Sprintf("%s\n\nstdout:\n%s\n\nstderr:\n%s", err, res.Stdout, res.Stderr),
-		)
+		addCLIError(&resp.Diagnostics, "nomad-pack run failed", err)
 		return
 	}
+	tflog.Debug(ctx, "nomad-pack run succeeded", map[string]interface{}{"output": res.Stdout})
 
 	plan.ID = types.StringValue(dep.Name)
 	plan.Diff = types.StringValue("")
@@ -302,12 +317,10 @@ func (r *DeploymentResource) Delete(ctx context.Context, req resource.DeleteRequ
 
 	res, err := r.client.Destroy(ctx, state.toPackRef(), dep, r.detachFor(state))
 	if err != nil {
-		resp.Diagnostics.AddError(
-			"nomad-pack destroy failed",
-			fmt.Sprintf("%s\n\nstdout:\n%s\n\nstderr:\n%s", err, res.Stdout, res.Stderr),
-		)
+		addCLIError(&resp.Diagnostics, "nomad-pack destroy failed", err)
 		return
 	}
+	tflog.Debug(ctx, "nomad-pack destroy succeeded", map[string]interface{}{"output": res.Stdout})
 }
 
 // ImportState expects an import ID of the form "<pack>:<registry>:<ref>:<name>"
