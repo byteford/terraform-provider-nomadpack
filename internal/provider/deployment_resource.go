@@ -2,6 +2,8 @@ package provider
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -17,6 +19,24 @@ import (
 
 	"github.com/byteford/terraform-provider-nomadpack/internal/nomadpack"
 )
+
+// diffHash fingerprints a nomad-pack diff for storage in state. Only the
+// fact that it *changed* matters for triggering Terraform's plan/apply —
+// the actual human-readable text is surfaced separately via a warning
+// diagnostic, not through this value, so there's no reason to duplicate
+// potentially large multi-line diff text into the state file and into
+// Terraform's own native attribute-diff display. Empty input maps to an
+// empty hash (rather than the hash of an empty string) so "in sync" reads
+// as a plain empty value, not a mysterious constant hash. 16 hex chars
+// (64 bits) is overkill for accidental-collision odds at this scale —
+// this only needs to detect "something changed," not resist attack.
+func diffHash(diff string) string {
+	if diff == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(diff))
+	return hex.EncodeToString(sum[:])[:16]
+}
 
 // addCLIError renders a nomad-pack failure as a single, non-duplicated
 // diagnostic. For a *nomadpack.CLIError it shows the one most relevant
@@ -65,6 +85,7 @@ type deploymentResourceModel struct {
 	Vars     types.Map    `tfsdk:"vars"`
 	VarFiles types.List   `tfsdk:"var_files"`
 	Detach   types.Bool   `tfsdk:"detach"`
+	DiffHash types.String `tfsdk:"diff_hash"`
 }
 
 func (r *DeploymentResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -127,6 +148,20 @@ func (r *DeploymentResource) Schema(_ context.Context, _ resource.SchemaRequest,
 				Optional: true,
 				Description: "Override the provider's run_detach setting for this deployment. " +
 					"When true, Terraform does not wait for the deployment/evaluation to finish.",
+			},
+			"diff_hash": schema.StringAttribute{
+				Computed: true,
+				Description: "Fingerprint of the filtered `nomad-pack plan` diff (jobs nomad-pack " +
+					"marked as actually changed) as of the last refresh. Empty when in sync. This " +
+					"holds a hash rather than the diff text itself — the readable diff is surfaced " +
+					"via a `Will redeploy`/`Drift detected` warning instead, so this stays terse in " +
+					"`terraform plan`'s own attribute-level diff display rather than duplicating " +
+					"potentially large multi-line text there. It's deliberately NOT suppressed with " +
+					"UseStateForUnknown: its whole purpose is to change when drift is detected (e.g. " +
+					"someone stops a job manually outside Terraform), which is what makes `terraform " +
+					"plan` show `~ update in-place` and `terraform apply` actually call `nomad-pack " +
+					"run` to reconcile it — a plan-time warning alone doesn't cause anything to " +
+					"happen on `apply`; this attribute is what does.",
 			},
 		},
 	}
@@ -201,15 +236,24 @@ func (r *DeploymentResource) detachFor(m deploymentResourceModel) bool {
 // from whether a warning happened to appear. Terraform's own attribute
 // diff (e.g. `vars = {...}`) always shows regardless; this is specifically
 // about whether that attribute change actually reaches the deployed jobs.
-// The preview isn't persisted anywhere (nothing downstream depends on it,
-// and it's always stale the instant you apply), so it's surfaced as a
-// diagnostic rather than a stored attribute.
+//
+// It also explicitly sets the planned `diff` attribute to the preview
+// text. That's not just for display: without an explicit value here,
+// Terraform's default behavior for a Computed attribute during a planned
+// Update is to mark it "(known after apply)" rather than show the actual
+// content, since it can't know what the provider will compute — setting
+// it directly is what lets `terraform plan` show the real diff up front
+// instead of a placeholder.
 //
 // If nothing about the target deployment actually differs from state
 // (same pack/registry/ref/name/vars/var_files), this skips querying
-// nomad-pack entirely — Read already checked this exact target moments
-// earlier in the same plan cycle and would have warned about any drift
-// then, so there's nothing new to preview.
+// nomad-pack and leaves `diff` untouched — Read already checked this
+// exact target moments earlier in the same plan cycle, and Terraform's
+// default behavior for an untouched Computed attribute is to carry
+// forward whatever Read just wrote to state, which is already correct
+// (including reflecting drift, if Read found any — see Read's doc
+// comment for why that's what actually makes `terraform apply`
+// reconcile drift, not just report it).
 func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	if req.Plan.Raw.IsNull() {
 		return // Destroy: nothing planned to preview against.
@@ -262,7 +306,9 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 	// the moment to say plainly whether the cluster will actually change,
 	// rather than leaving the answer to be inferred from whether a
 	// warning showed up at all.
+	previewDiff := ""
 	if hasChanges {
+		previewDiff = diff
 		resp.Diagnostics.AddWarning(
 			fmt.Sprintf("Will redeploy: %q", packRef.Pack),
 			diff,
@@ -276,6 +322,7 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 				"the job, check that the pack's templates actually reference it.",
 		)
 	}
+	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("diff_hash"), types.StringValue(diffHash(previewDiff)))...)
 }
 
 // packRefsEqual and deploymentsEqual back ModifyPlan's shortcut: only
@@ -337,10 +384,18 @@ func (r *DeploymentResource) Create(ctx context.Context, req resource.CreateRequ
 	tflog.Debug(ctx, "nomad-pack run succeeded", map[string]interface{}{"output": res.Stdout})
 
 	plan.ID = types.StringValue(dep.Name)
+	plan.DiffHash = types.StringValue("")
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
+// Read compares the deployed jobs against what the pack currently renders
+// for this resource's recorded config, and writes the result into the
+// `diff` attribute — not just for display, but because that's what makes
+// externally-caused drift (e.g. someone stopping a job by hand) actually
+// get reconciled on the next `terraform apply`. A plan-time warning alone
+// doesn't cause Terraform to schedule anything; a changed attribute value
+// between the last committed state and this refresh does.
 func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var state deploymentResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -378,13 +433,17 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 
 	if hasChanges {
 		// Deployed jobs no longer match what this resource believes it
-		// deployed — most often a manual edit in the Nomad UI. This is
-		// informational; Terraform's own attribute-level diff already
-		// drives what actually gets changed on the next apply.
+		// deployed — most often a manual edit in the Nomad UI, or a job
+		// stopped by hand. Writing the hash into state (below) is what
+		// gets this actually fixed on `terraform apply`; the warning
+		// here carries the actual readable diff for a human to see why.
+		state.DiffHash = types.StringValue(diffHash(diff))
 		resp.Diagnostics.AddWarning(
 			fmt.Sprintf("Drift detected for %q", state.Pack.ValueString()),
 			diff,
 		)
+	} else {
+		state.DiffHash = types.StringValue("")
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
@@ -411,6 +470,7 @@ func (r *DeploymentResource) Update(ctx context.Context, req resource.UpdateRequ
 	tflog.Debug(ctx, "nomad-pack run succeeded", map[string]interface{}{"output": res.Stdout})
 
 	plan.ID = types.StringValue(dep.Name)
+	plan.DiffHash = types.StringValue("")
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }

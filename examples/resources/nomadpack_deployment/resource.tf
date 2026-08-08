@@ -14,6 +14,11 @@ resource "nomadpack_deployment" "authentik" {
   ]
 }
 
-# Pending changes and any drift detected from the deployed jobs show up as
-# a warning in `terraform plan` output rather than as an attribute here —
-# there's no `diff` output to reference.
+# Pending changes and any drift detected from the deployed jobs show up
+# both as a `Will redeploy`/`Drift detected` warning in `terraform plan`
+# output (the readable diff text), and as a hash in this attribute (which
+# is what actually makes `terraform apply` fix drift, not just report it —
+# see the `diff_hash` description for why it's a hash and not the text).
+output "authentik_diff_hash" {
+  value = nomadpack_deployment.authentik.diff_hash
+}
