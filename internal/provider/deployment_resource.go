@@ -275,12 +275,31 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 	}
 	packRef := plan.toPackRef()
 
+	// Fetch prior state once, used both for the dedupe shortcut below and
+	// as a fallback value for diff_hash if the live preview query fails —
+	// in both cases the goal is the same: never let diff_hash silently
+	// default to "(known after apply)" when there's a perfectly good,
+	// already-known value from Read moments earlier in the same cycle.
+	var priorDiffHash types.String
+	haveState := false
 	if !req.State.Raw.IsNull() {
 		var state deploymentResourceModel
 		if diags := req.State.Get(ctx, &state); !diags.HasError() {
 			if priorDep, err := state.toDeployment(ctx); err == nil {
+				haveState = true
+				priorDiffHash = state.DiffHash
 				if packRefsEqual(state.toPackRef(), packRef) && deploymentsEqual(priorDep, dep) {
-					return // Identical to what Read just checked — nothing new to preview.
+					// Nothing to preview, but diff_hash still needs an
+					// explicit value here. Terraform's default for a
+					// Computed attribute without UseStateForUnknown is to
+					// mark it "(known after apply)" on every single plan,
+					// not just when something else is changing — without
+					// this, every plan would show a spurious diff_hash
+					// change even when nothing actually changed. Carry
+					// forward exactly what Read already computed moments
+					// earlier for this same target.
+					resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("diff_hash"), priorDiffHash)...)
+					return
 				}
 			}
 		}
@@ -298,6 +317,13 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 				"for this plan, but apply will still surface a real error if the problem persists. "+
 				err.Error(),
 		)
+		if haveState {
+			// Same reasoning as the dedupe branch: fall back to Read's
+			// already-known value instead of letting this default to
+			// unknown, which would force a spurious update purely
+			// because the preview call happened to fail this once.
+			resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("diff_hash"), priorDiffHash)...)
+		}
 		return
 	}
 
