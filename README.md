@@ -115,6 +115,31 @@ across amd64/386/arm/arm64, zipping them, and attaching them plus a
 
 ## Known limitations
 
+- **`diff_hash`'s planned value must be unknown, not a concrete guess,
+  whenever Create/Update will run.** `Create`/`Update` always resolve
+  `diff_hash` to `""` on success, regardless of what was previewed.
+  `ModifyPlan` originally committed to a concrete pre-apply hash whenever
+  something would change, which produced a real `Provider produced
+  inconsistent result after apply` error the first time an actual change
+  was applied — Terraform requires a Computed attribute's final value to
+  exactly match what was planned unless it was explicitly left unknown.
+  `ModifyPlan` now sets `diff_hash` unknown whenever Create/Update is
+  about to run (`hasChanges || configTargetChanged`), and only commits to
+  a concrete value (`""`) in the one case neither will run at all. If
+  you're extending this resource with more Computed attributes that
+  Create/Update touch, this is the pattern to follow — don't let
+  `ModifyPlan` promise a value the actual apply might not deliver.
+- **A bare `terraform apply` (no saved plan file) invokes `ModifyPlan`
+  twice**, and will show its warning twice as a result — once for the
+  plan you're shown and approve, once more internally right before the
+  actual apply, since Terraform re-verifies the plan is still valid
+  immediately before executing it rather than trusting what it showed you
+  moments earlier. This is standard Terraform behavior, not specific to
+  this provider. `terraform plan -out=tfplan && terraform apply tfplan`
+  still calls `ModifyPlan` a second time as an integrity check on the
+  saved plan (so the warning still appears twice), but guarantees `apply`
+  executes the exact plan you reviewed rather than a silently re-derived
+  one — worth doing regardless of the duplicate warning.
 - **nomad-pack's exit code isn't fully trusted, and neither is a bare
   "in-place update" count.** In practice, `nomad-pack plan` has been
   observed reporting exit code `0` ("no changes") while its diff shows a

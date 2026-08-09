@@ -261,12 +261,19 @@ func (r *DeploymentResource) detachFor(m deploymentResourceModel) bool {
 //   - Nothing changed and nothing needs reconciling: silence. No warning
 //     box on a plan where there's genuinely nothing to say.
 //
-// It also explicitly sets the planned `diff_hash` attribute. That's not
-// just for display: without an explicit value here, Terraform's default
-// behavior for a Computed attribute during a planned Update is to mark it
-// "(known after apply)" rather than carry forward a concrete value, since
-// core can't know what the provider will compute — setting it directly is
-// what lets `terraform plan` show the real result up front.
+// It also sets the planned `diff_hash` attribute — but deliberately to
+// UNKNOWN, not a concrete guessed value, whenever Create/Update is going
+// to run. Create/Update always resolve diff_hash to "" on success (see
+// their own comments) regardless of what was previewed here; committing
+// to a concrete pre-apply value that Update might not actually match is
+// exactly what caused a real "Provider produced inconsistent result after
+// apply" error in practice — Terraform requires a Computed attribute's
+// final applied value to exactly equal what was planned, unless it was
+// explicitly left unknown. Marking it unknown here is what gives
+// Create/Update the freedom to report the real post-apply value without
+// violating that contract. The one case that sets a concrete value is
+// when nothing is going to run at all (silent, no-op plan) — there's
+// nothing Create/Update will contradict, since neither gets called.
 func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	if req.Plan.Raw.IsNull() {
 		return // Destroy: nothing planned to preview against.
@@ -288,9 +295,10 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 	}
 	packRef := plan.toPackRef()
 
-	// Used only to choose wording ("Will redeploy" vs "Drift detected")
-	// and as a diff_hash fallback if the live query below fails — NOT to
-	// decide whether to query at all; the query always runs regardless.
+	// Used to choose wording ("Will redeploy" vs "Drift detected") and to
+	// decide whether Create/Update will run at all even if the live query
+	// below fails — NOT to decide whether to query; the query always
+	// runs regardless.
 	var priorDiffHash types.String
 	haveState := false
 	configTargetChanged := true // assume changed (Create, or state unreadable) unless proven otherwise below
@@ -317,16 +325,23 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 				"for this plan, but apply will still surface a real error if the problem persists. "+
 				err.Error(),
 		)
-		if haveState {
+		if configTargetChanged {
+			// Update will run regardless (forced by some other attribute
+			// difference like vars/pack), so avoid guessing a concrete
+			// diff_hash it might not match — same reasoning as below.
+			resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("diff_hash"), types.StringUnknown())...)
+		} else if haveState {
+			// Nothing else is forcing an update; safest is to leave
+			// diff_hash exactly as Read last established it, so this
+			// preview failure alone doesn't spuriously trigger a
+			// reconcile Update never actually needed to run.
 			resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("diff_hash"), priorDiffHash)...)
 		}
 		return
 	}
 
-	previewDiff := ""
 	switch {
 	case hasChanges && configTargetChanged:
-		previewDiff = diff
 		resp.Diagnostics.AddWarning(
 			fmt.Sprintf("Will redeploy: %q", packRef.Pack),
 			diff,
@@ -336,7 +351,6 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 		// someone (or something) modified the deployed jobs outside
 		// Terraform. Same underlying check as above, different wording
 		// so it's clear this isn't a result of your own config change.
-		previewDiff = diff
 		resp.Diagnostics.AddWarning(
 			fmt.Sprintf("Drift detected for %q", packRef.Pack),
 			diff,
@@ -354,7 +368,14 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 		// drifted. Deliberately silent — a plan with genuinely nothing
 		// to report about this resource shouldn't show a warning box.
 	}
-	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("diff_hash"), types.StringValue(diffHash(previewDiff)))...)
+
+	if hasChanges || configTargetChanged {
+		// Create/Update is about to run (see the function doc comment
+		// for why this must be unknown, not a concrete guess).
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("diff_hash"), types.StringUnknown())...)
+	} else {
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("diff_hash"), types.StringValue(""))...)
+	}
 }
 
 // packRefsEqual and deploymentsEqual back ModifyPlan's wording decision
