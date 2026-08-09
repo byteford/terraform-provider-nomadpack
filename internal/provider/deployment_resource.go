@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -74,6 +75,46 @@ func NewDeploymentResource() resource.Resource {
 type DeploymentResource struct {
 	client    *nomadpack.Client
 	runDetach bool
+
+	// warnedOnce suppresses showing the exact same ModifyPlan warning
+	// twice within a single provider process lifetime. Terraform Core
+	// internally calls PlanResourceChange (which runs ModifyPlan) twice
+	// for a bare `terraform apply` — once for the plan you review and
+	// approve, once more immediately before actually executing it, as an
+	// integrity check — and shows every diagnostic from both calls. This
+	// is a confirmed Terraform Core bug pattern (see
+	// https://github.com/hashicorp/terraform/issues/35931), but the fix
+	// that landed only covers `check` blocks, not general resource
+	// diagnostics like these, so there's nothing to rely on upstream yet.
+	//
+	// A single `terraform apply` invocation keeps the same provider
+	// process running for its whole duration, so an in-memory,
+	// process-lifetime cache is enough to recognize "I already showed
+	// this exact warning for this exact resource in this run" and skip
+	// the repeat — without losing the accuracy of the underlying live
+	// check, which is the whole point of ModifyPlan existing.
+	//
+	// Deliberately without a TTL or eviction: for normal local CLI use,
+	// each `terraform` invocation spawns a fresh provider subprocess, so
+	// this resets naturally between commands. It would NOT reset within
+	// a single long-lived provider process (e.g. some remote-execution
+	// setups that reuse a provider server across multiple applies), where
+	// this could suppress a warning that's genuinely new in a later,
+	// separate apply. Worth knowing if you ever move off local CLI use.
+	warnedOnce sync.Map // key: string -> struct{}
+}
+
+// addWarningOnce emits a warning diagnostic unless the exact same
+// (resourceKey, summary, detail) combination was already shown earlier in
+// this provider process — see the warnedOnce field doc for why that's
+// sufficient to fix Terraform's plan/apply double-invocation without
+// risking silently dropping a warning that's actually different.
+func (r *DeploymentResource) addWarningOnce(diags *diag.Diagnostics, resourceKey, summary, detail string) {
+	key := resourceKey + "\x00" + summary + "\x00" + detail
+	if _, alreadyShown := r.warnedOnce.LoadOrStore(key, struct{}{}); alreadyShown {
+		return
+	}
+	diags.AddWarning(summary, detail)
 }
 
 type deploymentResourceModel struct {
@@ -319,7 +360,7 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 		// e.g. a briefly unreachable Nomad cluster shouldn't block
 		// `terraform plan`. Create/Update will surface a real error at
 		// apply time if the problem persists.
-		resp.Diagnostics.AddWarning(
+		r.addWarningOnce(&resp.Diagnostics, packRef.Pack,
 			"Couldn't preview nomad-pack diff",
 			"nomad-pack plan failed while previewing this change; no preview is available "+
 				"for this plan, but apply will still surface a real error if the problem persists. "+
@@ -342,7 +383,7 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 
 	switch {
 	case hasChanges && configTargetChanged:
-		resp.Diagnostics.AddWarning(
+		r.addWarningOnce(&resp.Diagnostics, packRef.Pack,
 			fmt.Sprintf("Will redeploy: %q", packRef.Pack),
 			diff,
 		)
@@ -351,12 +392,12 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 		// someone (or something) modified the deployed jobs outside
 		// Terraform. Same underlying check as above, different wording
 		// so it's clear this isn't a result of your own config change.
-		resp.Diagnostics.AddWarning(
+		r.addWarningOnce(&resp.Diagnostics, packRef.Pack,
 			fmt.Sprintf("Drift detected for %q", packRef.Pack),
 			diff,
 		)
 	case !hasChanges && configTargetChanged:
-		resp.Diagnostics.AddWarning(
+		r.addWarningOnce(&resp.Diagnostics, packRef.Pack,
 			fmt.Sprintf("Will NOT redeploy: %q", packRef.Pack),
 			"This change doesn't alter what nomad-pack renders for any job in this pack — "+
 				"nomad-pack run will still execute (refreshing its own tracking metadata) but "+
