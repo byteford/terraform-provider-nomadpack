@@ -19,20 +19,34 @@ and drives its own lifecycle commands:
 nomad-pack's own injected job metadata (`pack.name`, `pack.version`, etc.)
 stays the single source of truth for what's deployed on the cluster — this
 provider just automates driving the CLI consistently. `diff_hash` holds a
-fingerprint of the last filtered `nomad-pack plan` diff, and it's more than
-informational: writing a non-empty value there when `Read` detects drift
-is what causes `terraform plan` to show `~ update in-place` and
-`terraform apply` to actually run `nomad-pack run` to reconcile it — a
-plan-time warning alone doesn't cause Terraform to schedule anything,
-since Terraform's apply behavior is driven entirely by whether recorded
-state differs from what's expected, not by diagnostic text. It's a hash
-rather than the diff text itself so Terraform's own attribute-diff display
-stays terse instead of duplicating potentially large multi-line text that
-the `Will redeploy`/`Drift detected` warning already shows more readably.
-`ModifyPlan` (in `deployment_resource.go`) additionally previews this for
-your *pending config change* (not just externally-caused drift), surfacing
-the same information as a warning so you don't have to go decode a hash to
-know what's about to happen.
+fingerprint of the last `nomad-pack plan` diff, and it's more than
+informational: writing a non-empty value there is what causes `terraform
+plan` to show `~ update in-place` and `terraform apply` to actually run
+`nomad-pack run` to reconcile it — a plan-time warning alone doesn't cause
+Terraform to schedule anything, since apply behavior is driven entirely by
+whether recorded state differs from what's expected. It's a hash rather
+than the diff text itself so Terraform's own attribute-diff display stays
+terse instead of duplicating potentially large multi-line text that the
+warning already shows more readably.
+
+`diff_hash` is set by both `Read` and `ModifyPlan`, but only `ModifyPlan`
+ever emits a warning. Read runs during refresh, using state as it stood
+*before* your pending config change — it can't know what you're about to
+apply, so it can't reliably say what `terraform apply` will actually do.
+Early versions of this provider had Read warn too, which produced
+genuinely confusing plans: moving a var from a pack default into an
+explicit Terraform override could show a scary `Drift detected` (Read,
+checking the old vars) right next to a reassuring `Will NOT redeploy`
+(ModifyPlan, checking the new ones) — both individually accurate, jointly
+confusing. `ModifyPlan` alone decides what to say now, always via a live
+`nomad-pack plan` call against your actual pending config (even when the
+target hasn't changed from state — this is deliberately not skipped
+anymore, to guarantee there's only ever one check and one message):
+`Will redeploy` / `Drift detected` (wording only, same underlying check —
+whether the change was yours or purely external) when something on the
+cluster will actually change, `Will NOT redeploy` when your config changed
+but the render didn't, or nothing at all when there's genuinely nothing to
+report.
 
 **Requirement:** the `nomad-pack` binary must be present on PATH wherever
 Terraform runs (or point `provider.binary_path` at it). It is not vendored

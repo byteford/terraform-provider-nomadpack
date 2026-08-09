@@ -229,31 +229,44 @@ func (r *DeploymentResource) detachFor(m deploymentResourceModel) bool {
 
 // ModifyPlan previews the effect of the pending config against the live
 // cluster, using `nomad-pack plan` targeted at the *new* pack/vars rather
-// than what's currently deployed. Whenever Terraform is actually about to
-// run Update (the target genuinely differs from state), this states
-// plainly whether the cluster will change or not — as a "Will redeploy" /
-// "Will NOT redeploy" warning — rather than leaving that to be inferred
-// from whether a warning happened to appear. Terraform's own attribute
-// diff (e.g. `vars = {...}`) always shows regardless; this is specifically
-// about whether that attribute change actually reaches the deployed jobs.
+// than what's currently deployed. It is the SOLE source of user-facing
+// warnings for this resource — Read (see its own doc comment) silently
+// updates `diff_hash` but never warns, specifically to avoid two
+// independent checks (Read's old-state comparison vs. this one's new-config
+// comparison) ever disagreeing and showing two conflicting messages in the
+// same plan, which is exactly what happened when moving a var from a
+// pack default into an explicit override: Read's old-state check found
+// "drift" that a fresh check against the actual pending config showed was
+// a no-op. Only ModifyPlan has visibility into both prior state AND the
+// pending config, so only it can give the answer that actually matters:
+// "what will `terraform apply` really do."
 //
-// It also explicitly sets the planned `diff` attribute to the preview
-// text. That's not just for display: without an explicit value here,
-// Terraform's default behavior for a Computed attribute during a planned
-// Update is to mark it "(known after apply)" rather than show the actual
-// content, since it can't know what the provider will compute — setting
-// it directly is what lets `terraform plan` show the real diff up front
-// instead of a placeholder.
+// This always makes a live `nomad-pack plan` call — even when the target
+// is identical to prior state — rather than skipping it when nothing
+// target-relevant changed. That's a deliberate trade of a bit of extra
+// nomad-pack invocation cost (one more call per plan, negligible at
+// homelab scale) for a hard guarantee against the double-warning problem:
+// with a single check driving a single decision, there's no way to end up
+// with two disagreeing messages.
 //
-// If nothing about the target deployment actually differs from state
-// (same pack/registry/ref/name/vars/var_files), this skips querying
-// nomad-pack and leaves `diff` untouched — Read already checked this
-// exact target moments earlier in the same plan cycle, and Terraform's
-// default behavior for an untouched Computed attribute is to carry
-// forward whatever Read just wrote to state, which is already correct
-// (including reflecting drift, if Read found any — see Read's doc
-// comment for why that's what actually makes `terraform apply`
-// reconcile drift, not just report it).
+// Exactly one of three things happens:
+//   - Something will actually change on the cluster: "Will redeploy" (if
+//     your config also changed) or "Drift detected" (if your config
+//     didn't — the change is purely external) — wording differs only to
+//     say clearly whether this is your doing or not; the underlying check
+//     and the `diff_hash` mechanics are identical either way.
+//   - Your config changed but nothing on the cluster will: "Will NOT
+//     redeploy", so you're not left guessing whether a var actually did
+//     anything.
+//   - Nothing changed and nothing needs reconciling: silence. No warning
+//     box on a plan where there's genuinely nothing to say.
+//
+// It also explicitly sets the planned `diff_hash` attribute. That's not
+// just for display: without an explicit value here, Terraform's default
+// behavior for a Computed attribute during a planned Update is to mark it
+// "(known after apply)" rather than carry forward a concrete value, since
+// core can't know what the provider will compute — setting it directly is
+// what lets `terraform plan` show the real result up front.
 func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	if req.Plan.Raw.IsNull() {
 		return // Destroy: nothing planned to preview against.
@@ -275,32 +288,19 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 	}
 	packRef := plan.toPackRef()
 
-	// Fetch prior state once, used both for the dedupe shortcut below and
-	// as a fallback value for diff_hash if the live preview query fails —
-	// in both cases the goal is the same: never let diff_hash silently
-	// default to "(known after apply)" when there's a perfectly good,
-	// already-known value from Read moments earlier in the same cycle.
+	// Used only to choose wording ("Will redeploy" vs "Drift detected")
+	// and as a diff_hash fallback if the live query below fails — NOT to
+	// decide whether to query at all; the query always runs regardless.
 	var priorDiffHash types.String
 	haveState := false
+	configTargetChanged := true // assume changed (Create, or state unreadable) unless proven otherwise below
 	if !req.State.Raw.IsNull() {
 		var state deploymentResourceModel
 		if diags := req.State.Get(ctx, &state); !diags.HasError() {
 			if priorDep, err := state.toDeployment(ctx); err == nil {
 				haveState = true
 				priorDiffHash = state.DiffHash
-				if packRefsEqual(state.toPackRef(), packRef) && deploymentsEqual(priorDep, dep) {
-					// Nothing to preview, but diff_hash still needs an
-					// explicit value here. Terraform's default for a
-					// Computed attribute without UseStateForUnknown is to
-					// mark it "(known after apply)" on every single plan,
-					// not just when something else is changing — without
-					// this, every plan would show a spurious diff_hash
-					// change even when nothing actually changed. Carry
-					// forward exactly what Read already computed moments
-					// earlier for this same target.
-					resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("diff_hash"), priorDiffHash)...)
-					return
-				}
+				configTargetChanged = !(packRefsEqual(state.toPackRef(), packRef) && deploymentsEqual(priorDep, dep))
 			}
 		}
 	}
@@ -318,28 +318,30 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 				err.Error(),
 		)
 		if haveState {
-			// Same reasoning as the dedupe branch: fall back to Read's
-			// already-known value instead of letting this default to
-			// unknown, which would force a spurious update purely
-			// because the preview call happened to fail this once.
 			resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("diff_hash"), priorDiffHash)...)
 		}
 		return
 	}
 
-	// Reaching here means Terraform is about to run Update (dep differed
-	// from state, or this is a brand-new resource) — so this is exactly
-	// the moment to say plainly whether the cluster will actually change,
-	// rather than leaving the answer to be inferred from whether a
-	// warning showed up at all.
 	previewDiff := ""
-	if hasChanges {
+	switch {
+	case hasChanges && configTargetChanged:
 		previewDiff = diff
 		resp.Diagnostics.AddWarning(
 			fmt.Sprintf("Will redeploy: %q", packRef.Pack),
 			diff,
 		)
-	} else {
+	case hasChanges && !configTargetChanged:
+		// Nothing in config changed, so this is purely external —
+		// someone (or something) modified the deployed jobs outside
+		// Terraform. Same underlying check as above, different wording
+		// so it's clear this isn't a result of your own config change.
+		previewDiff = diff
+		resp.Diagnostics.AddWarning(
+			fmt.Sprintf("Drift detected for %q", packRef.Pack),
+			diff,
+		)
+	case !hasChanges && configTargetChanged:
 		resp.Diagnostics.AddWarning(
 			fmt.Sprintf("Will NOT redeploy: %q", packRef.Pack),
 			"This change doesn't alter what nomad-pack renders for any job in this pack — "+
@@ -347,13 +349,17 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 				"nothing on the cluster will actually change. If a var was expected to affect "+
 				"the job, check that the pack's templates actually reference it.",
 		)
+	default:
+		// !hasChanges && !configTargetChanged: nothing changed, nothing
+		// drifted. Deliberately silent — a plan with genuinely nothing
+		// to report about this resource shouldn't show a warning box.
 	}
 	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("diff_hash"), types.StringValue(diffHash(previewDiff)))...)
 }
 
-// packRefsEqual and deploymentsEqual back ModifyPlan's shortcut: only
-// re-query nomad-pack when the target deployment genuinely differs from
-// what Read already checked this same plan cycle.
+// packRefsEqual and deploymentsEqual back ModifyPlan's wording decision
+// ("Will redeploy" vs "Drift detected") — they no longer decide whether to
+// query nomad-pack, only whether the target changed from state.
 func packRefsEqual(a, b nomadpack.PackRef) bool {
 	return a.Pack == b.Pack && a.Registry == b.Registry && a.Ref == b.Ref
 }
@@ -416,12 +422,19 @@ func (r *DeploymentResource) Create(ctx context.Context, req resource.CreateRequ
 }
 
 // Read compares the deployed jobs against what the pack currently renders
-// for this resource's recorded config, and writes the result into the
-// `diff` attribute — not just for display, but because that's what makes
+// for this resource's recorded config, and writes the result into
+// `diff_hash` — not just for display, but because that's what makes
 // externally-caused drift (e.g. someone stopping a job by hand) actually
 // get reconciled on the next `terraform apply`. A plan-time warning alone
 // doesn't cause Terraform to schedule anything; a changed attribute value
 // between the last committed state and this refresh does.
+//
+// Deliberately silent (no warning diagnostic here): this check uses OLD
+// state, which can't know about a pending config change you haven't
+// applied yet. ModifyPlan runs afterward with visibility into both old
+// state AND the new config, and is the sole place that decides what to
+// tell you — see its doc comment for why having two independent checks
+// warn separately caused confusing, sometimes-contradictory messages.
 func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var state deploymentResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -458,16 +471,7 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 	}
 
 	if hasChanges {
-		// Deployed jobs no longer match what this resource believes it
-		// deployed — most often a manual edit in the Nomad UI, or a job
-		// stopped by hand. Writing the hash into state (below) is what
-		// gets this actually fixed on `terraform apply`; the warning
-		// here carries the actual readable diff for a human to see why.
 		state.DiffHash = types.StringValue(diffHash(diff))
-		resp.Diagnostics.AddWarning(
-			fmt.Sprintf("Drift detected for %q", state.Pack.ValueString()),
-			diff,
-		)
 	} else {
 		state.DiffHash = types.StringValue("")
 	}
