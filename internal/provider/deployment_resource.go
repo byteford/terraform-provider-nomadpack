@@ -77,30 +77,35 @@ type DeploymentResource struct {
 	runDetach bool
 
 	// warnedOnce suppresses showing the exact same ModifyPlan warning
-	// twice within a single provider process lifetime. Terraform Core
-	// internally calls PlanResourceChange (which runs ModifyPlan) twice
-	// for a bare `terraform apply` — once for the plan you review and
-	// approve, once more immediately before actually executing it, as an
-	// integrity check — and shows every diagnostic from both calls. This
-	// is a confirmed Terraform Core bug pattern (see
-	// https://github.com/hashicorp/terraform/issues/35931), but the fix
-	// that landed only covers `check` blocks, not general resource
-	// diagnostics like these, so there's nothing to rely on upstream yet.
+	// twice within a single provider process lifetime.
 	//
-	// A single `terraform apply` invocation keeps the same provider
-	// process running for its whole duration, so an in-memory,
-	// process-lifetime cache is enough to recognize "I already showed
-	// this exact warning for this exact resource in this run" and skip
-	// the repeat — without losing the accuracy of the underlying live
-	// check, which is the whole point of ModifyPlan existing.
+	// NOTE: this does NOT fix the "warning shown again after Modifications
+	// complete" duplication seen in a normal `terraform apply` — that was
+	// the original hypothesis (Terraform Core allegedly re-invoking
+	// PlanResourceChange a second time before applying), and it turned out
+	// to be wrong. Confirmed wrong because the duplicate warning's content
+	// (down to the exact `--check-index=N`) was byte-identical across both
+	// occurrences and STILL appeared twice despite this dedup — which
+	// wouldn't happen if the provider were genuinely being asked twice and
+	// this cache were intercepting the second ask. The second warning also
+	// appears strictly AFTER that resource's "Modifications complete"
+	// line, not before its apply begins, which doesn't fit "the provider
+	// was called again before applying" either.
 	//
-	// Deliberately without a TTL or eviction: for normal local CLI use,
-	// each `terraform` invocation spawns a fresh provider subprocess, so
-	// this resets naturally between commands. It would NOT reset within
-	// a single long-lived provider process (e.g. some remote-execution
-	// setups that reuse a provider server across multiple applies), where
-	// this could suppress a warning that's genuinely new in a later,
-	// separate apply. Worth knowing if you ever move off local CLI use.
+	// The better-supported explanation: this is the same underlying bug
+	// class as https://github.com/hashicorp/terraform/issues/35931 —
+	// Terraform Core's own diagnostic-deduplication logic failing to
+	// recognize two references to the SAME diagnostic object as a
+	// duplicate in certain code paths — just manifesting for a resource's
+	// ModifyPlan diagnostic during apply rather than for a `check` block
+	// (which is the only case #35944 actually fixed). If that's right,
+	// the provider is only ever invoked once and there's nothing to
+	// deduplicate on this side at all; the duplication happens entirely
+	// within Terraform CLI's own rendering. This field is kept as a
+	// legitimate (if here, insufficient) safety net for the narrow case
+	// where a provider process genuinely is invoked twice — e.g. some
+	// remote-execution setups that behave differently from local CLI use
+	// — but don't expect it to fix the ordinary local-CLI symptom above.
 	warnedOnce sync.Map // key: string -> struct{}
 }
 
@@ -183,7 +188,12 @@ func (r *DeploymentResource) Schema(_ context.Context, _ resource.SchemaRequest,
 			"var_files": schema.ListAttribute{
 				Optional:    true,
 				ElementType: types.StringType,
-				Description: "Paths to HCL variable override files, passed as repeated -var-file flags.",
+				Description: "Paths to HCL variable override files, passed as repeated -var-file flags. " +
+					"nomad-pack resolves these relative to the current working directory (wherever " +
+					"terraform/nomad-pack is run from), NOT relative to `pack` — a var file that lives " +
+					"inside a local-path pack's own directory needs an absolute path or one built from " +
+					"`pack`, e.g. \"${local.my_pack_path}/vars.hcl\", not a path written as if relative " +
+					"to the pack.",
 			},
 			"detach": schema.BoolAttribute{
 				Optional: true,

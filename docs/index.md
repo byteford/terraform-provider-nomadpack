@@ -28,6 +28,11 @@ provider "nomadpack" {
   address    = "https://nomad.example.internal:4646"
   namespace  = "default"
   run_detach = false
+
+  # Recommended: makes relative paths in `pack`/`var_files` resolve
+  # against your Terraform root, instead of depending on whatever working
+  # directory Terraform happens to launch the provider subprocess with.
+  working_directory = path.root
 }
 ```
 
@@ -47,3 +52,4 @@ provider "nomadpack" {
 - `tls_server_name` (String) SNI host to use when connecting via TLS.
 - `tls_skip_verify` (Boolean) Skip TLS certificate verification. Not recommended.
 - `token` (String, Sensitive) Nomad ACL token. Falls back to NOMAD_TOKEN if unset.
+- `working_directory` (String) Working directory for every nomad-pack subprocess invocation. Left unset, the subprocess inherits the provider process's own working directory — which Terraform does not guarantee matches the directory you actually run `terraform apply` from, since it launches provider plugin binaries as separate subprocesses. Relative paths in a resource's `pack` or `var_files` that look correct can still fail to resolve as a result. Set this to `path.root` to remove that ambiguity: `working_directory = path.root`.

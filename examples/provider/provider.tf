@@ -14,4 +14,9 @@ provider "nomadpack" {
   address    = "https://nomad.example.internal:4646"
   namespace  = "default"
   run_detach = false
+
+  # Recommended: makes relative paths in `pack`/`var_files` resolve
+  # against your Terraform root, instead of depending on whatever working
+  # directory Terraform happens to launch the provider subprocess with.
+  working_directory = path.root
 }

@@ -27,6 +27,7 @@ type NomadPackProvider struct {
 // nomadPackProviderModel maps provider schema data to a Go type.
 type nomadPackProviderModel struct {
 	BinaryPath    types.String `tfsdk:"binary_path"`
+	WorkingDir    types.String `tfsdk:"working_directory"`
 	Address       types.String `tfsdk:"address"`
 	Namespace     types.String `tfsdk:"namespace"`
 	Region        types.String `tfsdk:"region"`
@@ -60,6 +61,16 @@ func (p *NomadPackProvider) Schema(_ context.Context, _ provider.SchemaRequest, 
 			"binary_path": schema.StringAttribute{
 				Optional:    true,
 				Description: "Path to the nomad-pack binary. Defaults to \"nomad-pack\" resolved from PATH.",
+			},
+			"working_directory": schema.StringAttribute{
+				Optional: true,
+				Description: "Working directory for every nomad-pack subprocess invocation. Left unset, " +
+					"the subprocess inherits the provider process's own working directory — which " +
+					"Terraform does not guarantee matches the directory you actually run `terraform " +
+					"apply` from, since it launches provider plugin binaries as separate subprocesses. " +
+					"Relative paths in a resource's `pack` or `var_files` that look correct can still " +
+					"fail to resolve as a result. Set this to `path.root` to remove that ambiguity: " +
+					"`working_directory = path.root`.",
 			},
 			"address": schema.StringAttribute{
 				Optional:    true,
@@ -117,6 +128,7 @@ func (p *NomadPackProvider) Configure(ctx context.Context, req provider.Configur
 
 	client := &nomadpack.Client{
 		BinaryPath: cfg.BinaryPath.ValueString(),
+		WorkingDir: cfg.WorkingDir.ValueString(),
 		Cluster: nomadpack.ClusterConfig{
 			Address:       cfg.Address.ValueString(),
 			Namespace:     cfg.Namespace.ValueString(),

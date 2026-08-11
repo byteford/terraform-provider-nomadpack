@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -70,6 +71,18 @@ type ClusterConfig struct {
 type Client struct {
 	BinaryPath string
 	Cluster    ClusterConfig
+
+	// WorkingDir, if set, is used as the working directory for every
+	// nomad-pack subprocess invocation. Left empty, the subprocess
+	// inherits the provider process's own working directory — which
+	// Terraform does not guarantee matches the directory you actually
+	// run `terraform apply` from, since it launches provider plugin
+	// binaries as separate subprocesses. Relative paths in `pack` or
+	// `var_files` that look correct can still fail to resolve as a
+	// result. Setting this explicitly (typically to `path.root` via the
+	// provider's working_directory attribute) removes that ambiguity
+	// entirely rather than relying on implicit inheritance.
+	WorkingDir string
 }
 
 // PackRef identifies which pack to operate on.
@@ -179,13 +192,79 @@ func sortStrings(s []string) {
 	}
 }
 
+// looksLikeFilesystemPath mirrors the same heuristic the Terraform
+// resource layer uses (a path separator means "filesystem path", not a
+// registry pack name) — kept as a small local duplicate rather than a
+// cross-package dependency, since it's a one-line check.
+func looksLikeFilesystemPath(s string) bool {
+	return strings.ContainsAny(s, "/\\")
+}
+
+// resolvePath resolves a relative filesystem path to an absolute one,
+// against WorkingDir if set, otherwise the provider process's own working
+// directory. Non-path values (registry pack names) and already-absolute
+// paths pass through unchanged.
+//
+// This matters beyond "does the file exist": nomad-pack appears to use
+// the literal pack path string as part of a job's tracked identity, so a
+// relative and absolute path pointing at the exact same directory can be
+// treated as two different deployments — surfacing as errors like
+// `job with id "x" already exists and is part of deployment "<other
+// string>"` the moment the same directory gets referenced with a
+// differently-spelled path than whatever was originally used for
+// `nomad-pack run` (e.g. importing with a relative path when the
+// original deploy used an absolute one). Always resolving to a single
+// canonical absolute form before nomad-pack ever sees it removes that
+// whole class of ambiguity, rather than requiring the person to
+// remember and exactly match whatever spelling was used the first time.
+func (c *Client) resolvePath(p string) string {
+	if p == "" || !looksLikeFilesystemPath(p) || filepath.IsAbs(p) {
+		return p
+	}
+	base := c.WorkingDir
+	if base == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return p
+		}
+		base = wd
+	}
+	return filepath.Clean(filepath.Join(base, p))
+}
+
+// resolvedPackRef returns pack with Pack resolved via resolvePath.
+func (c *Client) resolvedPackRef(pack PackRef) PackRef {
+	pack.Pack = c.resolvePath(pack.Pack)
+	return pack
+}
+
+// resolvedDeployment returns d with every VarFiles entry resolved via
+// resolvePath. Vars (key=value overrides) are left untouched — a var's
+// value might happen to look like a path, but the provider has no
+// general way to know that's what it semantically represents.
+func (c *Client) resolvedDeployment(d Deployment) Deployment {
+	if len(d.VarFiles) == 0 {
+		return d
+	}
+	resolved := make([]string, len(d.VarFiles))
+	for i, f := range d.VarFiles {
+		resolved[i] = c.resolvePath(f)
+	}
+	d.VarFiles = resolved
+	return d
+}
+
 func (c *Client) exec(ctx context.Context, args []string) (*Result, error) {
 	tflog.Debug(ctx, "executing nomad-pack", map[string]interface{}{
-		"binary": c.binary(),
-		"args":   redactArgs(args),
+		"binary":      c.binary(),
+		"args":        redactArgs(args),
+		"working_dir": c.WorkingDir,
 	})
 
 	cmd := exec.CommandContext(ctx, c.binary(), args...)
+	if c.WorkingDir != "" {
+		cmd.Dir = c.WorkingDir
+	}
 	// nomad-pack's output rendering (go-glint) can emit ANSI color codes
 	// if it misdetects a TTY. Force it off so error text stays clean when
 	// surfaced through Terraform diagnostics.
@@ -239,6 +318,9 @@ func (c *Client) exec(ctx context.Context, args []string) (*Result, error) {
 // (routine, uninformative) job blocks so warnings shown to the user
 // aren't a wall of unrelated boilerplate.
 func (c *Client) Plan(ctx context.Context, pack PackRef, d Deployment) (hasChanges bool, diff string, res *Result, err error) {
+	pack = c.resolvedPackRef(pack)
+	d = c.resolvedDeployment(d)
+
 	args := []string{"plan", pack.Pack, "--diff"}
 	args = append(args, packArgs(pack)...)
 	args = append(args, deploymentArgs(d)...)
@@ -324,6 +406,9 @@ func filterChangedJobBlocks(output string) (changed string, anyChanged bool) {
 // deployment/evaluation to finish, which matters for long Terraform applies
 // against slow-to-heal jobs.
 func (c *Client) Run(ctx context.Context, pack PackRef, d Deployment, detach bool) (*Result, error) {
+	pack = c.resolvedPackRef(pack)
+	d = c.resolvedDeployment(d)
+
 	args := []string{"run", pack.Pack}
 	args = append(args, packArgs(pack)...)
 	args = append(args, deploymentArgs(d)...)
@@ -348,6 +433,9 @@ func (c *Client) Run(ctx context.Context, pack PackRef, d Deployment, detach boo
 // Destroy stops and purges every job nomad-pack associates with this named
 // deployment, via `nomad-pack destroy` (equivalent to `stop --purge`).
 func (c *Client) Destroy(ctx context.Context, pack PackRef, d Deployment, detach bool) (*Result, error) {
+	pack = c.resolvedPackRef(pack)
+	d = c.resolvedDeployment(d)
+
 	args := []string{"destroy", pack.Pack}
 	args = append(args, packArgs(pack)...)
 	args = append(args, deploymentArgs(d)...)

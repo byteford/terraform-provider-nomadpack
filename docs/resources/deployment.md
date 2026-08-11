@@ -24,9 +24,26 @@ resource "nomadpack_deployment" "authentik" {
     replicas      = "2"
   }
 
+  # nomad-pack resolves var_files relative to the current working
+  # directory (wherever terraform is run from), never relative to `pack`.
+  # path.module is correct here because this file itself lives in the
+  # Terraform module — it is NOT relative to the pack's own directory.
   var_files = [
     "${path.module}/vars/authentik.hcl",
   ]
+}
+
+# For a local-path pack (as opposed to a registry pack like above), if
+# your var file lives inside the pack's own directory, build the path
+# from the same local rather than writing it as if relative to the pack —
+# nomad-pack won't resolve it that way.
+locals {
+  postgres_pack_path = "/mnt/e/devcastops/nomad-pack/postgres"
+}
+
+resource "nomadpack_deployment" "postgres" {
+  pack      = local.postgres_pack_path
+  var_files = ["${local.postgres_pack_path}/var_files/postgres.nomadpack.hcl"]
 }
 
 # Pending changes and any drift detected from the deployed jobs show up
@@ -52,7 +69,7 @@ output "authentik_diff_hash" {
 - `name` (String) Unique deployment name passed to nomad-pack's -name flag. Defaults to the pack name if unset.
 - `ref` (String) Git ref of the pack to deploy (tag, SHA, or `pack-name/vX.Y.Z`). Defaults to nomad-pack's own @latest resolution if unset. Pin this in production so `terraform apply` is reproducible instead of tracking a moving ref.
 - `registry` (String) Registry name containing the pack. Omit to use nomad-pack's default registry.
-- `var_files` (List of String) Paths to HCL variable override files, passed as repeated -var-file flags.
+- `var_files` (List of String) Paths to HCL variable override files, passed as repeated -var-file flags. nomad-pack resolves these relative to the current working directory (wherever terraform/nomad-pack is run from), NOT relative to `pack` — a var file that lives inside a local-path pack's own directory needs an absolute path or one built from `pack`, e.g. "${local.my_pack_path}/vars.hcl", not a path written as if relative to the pack.
 - `vars` (Map of String) Variable overrides passed to nomad-pack as repeated -var=key=value flags.
 
 ### Read-Only

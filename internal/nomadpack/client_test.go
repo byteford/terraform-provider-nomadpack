@@ -9,6 +9,96 @@ import (
 	"testing"
 )
 
+// TestWorkingDirIsAppliedToSubprocess writes a fake nomad-pack that reports
+// its own CWD via `pwd`, so this doesn't rely on parsing exec.Cmd internals
+// — it verifies the actual, real effect of setting Client.WorkingDir.
+func TestWorkingDirIsAppliedToSubprocess(t *testing.T) {
+	wantDir := t.TempDir()
+
+	scriptDir := t.TempDir()
+	scriptPath := filepath.Join(scriptDir, "nomad-pack")
+	script := "#!/bin/sh\npwd\nexit 0\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to write fake nomad-pack script: %v", err)
+	}
+
+	c := &Client{BinaryPath: scriptPath, WorkingDir: wantDir}
+	res, err := c.exec(context.Background(), []string{"version"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	gotDir := strings.TrimSpace(res.Stdout)
+	// Resolve symlinks on both sides (e.g. /tmp vs /private/tmp on macOS)
+	// so this doesn't fail on path representation differences unrelated
+	// to whether WorkingDir was actually honored.
+	wantResolved, _ := filepath.EvalSymlinks(wantDir)
+	gotResolved, _ := filepath.EvalSymlinks(gotDir)
+	if gotResolved != wantResolved {
+		t.Fatalf("subprocess ran with cwd %q, want %q", gotDir, wantDir)
+	}
+}
+
+func TestWorkingDirEmptyLeavesDefaultBehavior(t *testing.T) {
+	// With WorkingDir unset, exec.Cmd.Dir stays "" and the subprocess
+	// inherits the calling process's cwd — just confirming this doesn't
+	// error or otherwise misbehave when left at its zero value.
+	c := &Client{BinaryPath: fakeNomadPack(t, 0, "ok")}
+	if _, err := c.exec(context.Background(), []string{"version"}); err != nil {
+		t.Fatalf("unexpected error with empty WorkingDir: %v", err)
+	}
+}
+
+func TestResolvePathAbsoluteUnchanged(t *testing.T) {
+	c := &Client{}
+	if got := c.resolvePath("/mnt/e/devcastops/nomad-pack/traefik"); got != "/mnt/e/devcastops/nomad-pack/traefik" {
+		t.Fatalf("expected absolute path unchanged, got %q", got)
+	}
+}
+
+func TestResolvePathRegistryNameUnchanged(t *testing.T) {
+	c := &Client{WorkingDir: "/mnt/e/nomad_homelab/homelab_v2/traefik"}
+	if got := c.resolvePath("authentik"); got != "authentik" {
+		t.Fatalf("expected registry pack name unchanged, got %q", got)
+	}
+}
+
+func TestResolvePathRelativeResolvedAgainstWorkingDir(t *testing.T) {
+	c := &Client{WorkingDir: "/mnt/e/nomad_homelab/homelab_v2/traefik"}
+	got := c.resolvePath("../../../devcastops/nomad-pack/traefik")
+	want := "/mnt/e/devcastops/nomad-pack/traefik"
+	if got != want {
+		t.Fatalf("resolvePath(...) = %q, want %q", got, want)
+	}
+}
+
+func TestResolvePathEmptyWorkingDirFallsBackToProcessCwd(t *testing.T) {
+	c := &Client{} // WorkingDir unset
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd failed: %v", err)
+	}
+	got := c.resolvePath("./relative/pack")
+	want := filepath.Clean(filepath.Join(wd, "./relative/pack"))
+	if got != want {
+		t.Fatalf("resolvePath(...) = %q, want %q", got, want)
+	}
+}
+
+func TestResolvedDeploymentResolvesEachVarFile(t *testing.T) {
+	c := &Client{WorkingDir: "/mnt/e/nomad_homelab/homelab_v2/traefik"}
+	d := Deployment{
+		Name:     "traefik",
+		VarFiles: []string{"./vars/a.hcl", "/already/absolute/b.hcl"},
+	}
+	resolved := c.resolvedDeployment(d)
+	want := []string{
+		"/mnt/e/nomad_homelab/homelab_v2/traefik/vars/a.hcl",
+		"/already/absolute/b.hcl",
+	}
+	assertEqualArgs(t, resolved.VarFiles, want)
+}
+
 func TestClusterArgs(t *testing.T) {
 	c := &Client{
 		Cluster: ClusterConfig{

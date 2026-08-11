@@ -115,6 +115,34 @@ across amd64/386/arm/arm64, zipping them, and attaching them plus a
 
 ## Known limitations
 
+- **Relative paths in `pack`/`var_files` depend on the nomad-pack
+  subprocess's working directory, which isn't guaranteed to match the
+  directory you run `terraform apply` from.** Terraform launches provider
+  plugin binaries as separate subprocesses, and this provider doesn't
+  otherwise control what CWD that subprocess starts with — a relative
+  path that looks correct can still fail to resolve. Set
+  `working_directory = path.root` on the provider block to remove the
+  ambiguity entirely (see `examples/provider/provider.tf`); it's applied
+  as `exec.Cmd.Dir` for every nomad-pack invocation. This is unrelated to
+  the `pack`-vs-CWD distinction below — that one's about nomad-pack's own
+  path resolution rules; this one's about which directory nomad-pack even
+  starts in.
+
+- **`pack` and `var_files` are always resolved to absolute paths before
+  nomad-pack ever sees them** (`resolvePath` in `client.go`), against
+  `working_directory` if set, otherwise the provider process's own
+  working directory. This isn't just about resolving relative paths
+  correctly — nomad-pack appears to track a job's identity partly by the
+  literal pack path *string*, so a relative and absolute path pointing
+  at the exact same directory can be treated as two different
+  deployments. That surfaced concretely as `terraform import` failing
+  with `job with id "x" already exists and is part of deployment
+  "<the relative path just typed>"` when the original `nomad-pack run`
+  had used an absolute path and the import used a differently-spelled
+  relative one for the same directory. Always canonicalizing to a single
+  absolute form removes the ambiguity — you no longer need to remember
+  or match whatever spelling was originally used.
+
 - **`diff_hash`'s planned value must be unknown, not a concrete guess,
   whenever Create/Update will run.** `Create`/`Update` always resolve
   `diff_hash` to `""` on success, regardless of what was previewed.
@@ -129,17 +157,25 @@ across amd64/386/arm/arm64, zipping them, and attaching them plus a
   you're extending this resource with more Computed attributes that
   Create/Update touch, this is the pattern to follow — don't let
   `ModifyPlan` promise a value the actual apply might not deliver.
-- **A bare `terraform apply` (no saved plan file) invokes `ModifyPlan`
-  twice**, and will show its warning twice as a result — once for the
-  plan you're shown and approve, once more internally right before the
-  actual apply, since Terraform re-verifies the plan is still valid
-  immediately before executing it rather than trusting what it showed you
-  moments earlier. This is standard Terraform behavior, not specific to
-  this provider. `terraform plan -out=tfplan && terraform apply tfplan`
-  still calls `ModifyPlan` a second time as an integrity check on the
-  saved plan (so the warning still appears twice), but guarantees `apply`
-  executes the exact plan you reviewed rather than a silently re-derived
-  one — worth doing regardless of the duplicate warning.
+- **The `Will redeploy`/`Drift detected`/`Will NOT redeploy` warning can
+  appear twice during a normal `terraform apply`** — once during plan
+  review, once again after that resource's "Modifications complete" line.
+  This was investigated in depth and is very likely a Terraform Core
+  rendering bug (the same class as
+  [hashicorp/terraform#35931](https://github.com/hashicorp/terraform/issues/35931),
+  which HashiCorp's own team confirmed and labeled `bug`, but whose fix
+  only covers `check` blocks) rather than anything this provider can
+  control: the duplicate content is byte-identical between occurrences,
+  appears strictly after the resource's apply completes rather than
+  before it begins, and persisted even after adding a process-lifetime
+  dedup cache — none of which fit "the provider was asked twice." If
+  that diagnosis is right, Terraform CLI is re-displaying a diagnostic it
+  already has rather than asking the provider again, which means there's
+  nothing to intercept on this side. If you want this fixed, filing it
+  against `hashicorp/terraform` (referencing #35931 as the related, known
+  bug class) is the right venue — the `warnedOnce` field in
+  `deployment_resource.go` documents the failed hypothesis and the
+  reasoning that ruled it out, in case anyone revisits this later.
 - **nomad-pack's exit code isn't fully trusted, and neither is a bare
   "in-place update" count.** In practice, `nomad-pack plan` has been
   observed reporting exit code `0` ("no changes") while its diff shows a
