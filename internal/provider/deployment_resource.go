@@ -13,6 +13,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -131,6 +132,7 @@ type deploymentResourceModel struct {
 	Vars     types.Map    `tfsdk:"vars"`
 	VarFiles types.List   `tfsdk:"var_files"`
 	Detach   types.Bool   `tfsdk:"detach"`
+	Stopped  types.Bool   `tfsdk:"stopped"`
 	DiffHash types.String `tfsdk:"diff_hash"`
 }
 
@@ -199,6 +201,17 @@ func (r *DeploymentResource) Schema(_ context.Context, _ resource.SchemaRequest,
 				Optional: true,
 				Description: "Override the provider's run_detach setting for this deployment. " +
 					"When true, Terraform does not wait for the deployment/evaluation to finish.",
+			},
+			"stopped": schema.BoolAttribute{
+				Optional: true,
+				Computed: true,
+				Default:  booldefault.StaticBool(false),
+				Description: "Stop this deployment's jobs without removing nomad-pack's tracking " +
+					"of the deployment (`nomad-pack stop`, not `destroy`). Unlike destroying the " +
+					"resource (which purges the deployment and forgets it existed), a stopped " +
+					"deployment stays queryable and can be redeployed by setting this back to " +
+					"false — set it to true instead of removing the resource when you want to " +
+					"pause a pack's jobs temporarily.",
 			},
 			"diff_hash": schema.StringAttribute{
 				Computed: true,
@@ -352,6 +365,7 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 	// runs regardless.
 	var priorDiffHash types.String
 	haveState := false
+	wasStopped := false
 	configTargetChanged := true // assume changed (Create, or state unreadable) unless proven otherwise below
 	if !req.State.Raw.IsNull() {
 		var state deploymentResourceModel
@@ -359,9 +373,36 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 			if priorDep, err := state.toDeployment(ctx); err == nil {
 				haveState = true
 				priorDiffHash = state.DiffHash
+				wasStopped = state.Stopped.ValueBool()
 				configTargetChanged = !(packRefsEqual(state.toPackRef(), packRef) && deploymentsEqual(priorDep, dep))
 			}
 		}
+	}
+
+	isStopped := plan.Stopped.ValueBool()
+	stoppedChanged := haveState && wasStopped != isStopped
+
+	// While the plan targets stopped=true, skip the live `nomad-pack
+	// plan` call entirely: it compares against the pack's normal running
+	// spec, so a stopped deployment always reads as "everything missing"
+	// — noise, not real drift. Update (which runs Stop, not Run) is the
+	// only thing that needs to happen here.
+	if isStopped {
+		if stoppedChanged {
+			r.addWarningOnce(&resp.Diagnostics, packRef.Pack,
+				fmt.Sprintf("Will stop: %q", packRef.Pack),
+				"nomad-pack stop will run for this deployment (jobs stop, but nomad-pack keeps "+
+					"tracking it — set stopped back to false to redeploy).",
+			)
+			resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("diff_hash"), types.StringUnknown())...)
+		} else if haveState {
+			resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("diff_hash"), priorDiffHash)...)
+		}
+		return
+	}
+
+	if stoppedChanged {
+		configTargetChanged = true
 	}
 
 	hasChanges, diff, _, err := r.client.Plan(ctx, packRef, dep)
@@ -487,6 +528,15 @@ func (r *DeploymentResource) Create(ctx context.Context, req resource.CreateRequ
 	}
 	tflog.Debug(ctx, "nomad-pack run succeeded", map[string]interface{}{"output": res.Stdout})
 
+	if plan.Stopped.ValueBool() {
+		stopRes, err := r.client.Stop(ctx, plan.toPackRef(), dep, r.detachFor(plan))
+		if err != nil {
+			addCLIError(&resp.Diagnostics, "nomad-pack stop failed", err)
+			return
+		}
+		tflog.Debug(ctx, "nomad-pack stop succeeded", map[string]interface{}{"output": stopRes.Stdout})
+	}
+
 	plan.ID = types.StringValue(dep.Name)
 	plan.DiffHash = types.StringValue("")
 
@@ -511,6 +561,16 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 	var state deploymentResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// While stopped=true, nomad-pack plan will always show the jobs as
+	// missing/changed (they're not running) — that's expected, not
+	// drift, so skip the diff entirely rather than surface a false
+	// "Drift detected" warning every plan. diff_hash is left as-is
+	// (whatever it last held) since there's nothing new to report.
+	if state.Stopped.ValueBool() {
+		resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 		return
 	}
 
@@ -564,12 +624,21 @@ func (r *DeploymentResource) Update(ctx context.Context, req resource.UpdateRequ
 		return
 	}
 
-	res, err := r.client.Run(ctx, plan.toPackRef(), dep, r.detachFor(plan))
-	if err != nil {
-		addCLIError(&resp.Diagnostics, "nomad-pack run failed", err)
-		return
+	if plan.Stopped.ValueBool() {
+		res, err := r.client.Stop(ctx, plan.toPackRef(), dep, r.detachFor(plan))
+		if err != nil {
+			addCLIError(&resp.Diagnostics, "nomad-pack stop failed", err)
+			return
+		}
+		tflog.Debug(ctx, "nomad-pack stop succeeded", map[string]interface{}{"output": res.Stdout})
+	} else {
+		res, err := r.client.Run(ctx, plan.toPackRef(), dep, r.detachFor(plan))
+		if err != nil {
+			addCLIError(&resp.Diagnostics, "nomad-pack run failed", err)
+			return
+		}
+		tflog.Debug(ctx, "nomad-pack run succeeded", map[string]interface{}{"output": res.Stdout})
 	}
-	tflog.Debug(ctx, "nomad-pack run succeeded", map[string]interface{}{"output": res.Stdout})
 
 	plan.ID = types.StringValue(dep.Name)
 	plan.DiffHash = types.StringValue("")

@@ -464,6 +464,38 @@ func (c *Client) Destroy(ctx context.Context, pack PackRef, d Deployment, detach
 	return res, nil
 }
 
+// Stop stops (but does not purge) every job nomad-pack associates with this
+// named deployment, via `nomad-pack stop` (no `--purge`). Unlike Destroy,
+// nomad-pack keeps tracking the deployment afterward — it stays queryable
+// via `nomad-pack status`/`plan` (until Nomad's own garbage collector
+// eventually reaps it) and can be brought back with a subsequent `run`
+// against the same name, without needing to recreate the Terraform
+// resource. This is the "stop without destroying" operation.
+func (c *Client) Stop(ctx context.Context, pack PackRef, d Deployment, detach bool) (*Result, error) {
+	pack = c.resolvedPackRef(pack)
+	d = c.resolvedDeployment(d)
+
+	args := []string{"stop", pack.Pack}
+	args = append(args, packArgs(pack)...)
+	args = append(args, deploymentArgs(d)...)
+	args = append(args, c.clusterArgs()...)
+	if detach {
+		args = append(args, "--detach")
+	}
+
+	res, err := c.exec(ctx, args)
+	if err != nil {
+		return res, err
+	}
+	if res.ExitCode != 0 {
+		return res, &CLIError{
+			Op: "stop", Args: args, ExitCode: res.ExitCode,
+			Stdout: res.Stdout, Stderr: res.Stderr,
+		}
+	}
+	return res, nil
+}
+
 // redactArgs masks flag values that shouldn't end up in debug logs (which
 // people routinely paste into GitHub issues or CI output) even though
 // they're safe to pass on a local command line.

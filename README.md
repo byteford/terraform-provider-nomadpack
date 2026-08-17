@@ -11,10 +11,17 @@ and drives its own lifecycle commands:
 
 | Terraform op | nomad-pack command                    |
 |--------------|----------------------------------------|
-| Create       | `nomad-pack run <pack> -name=<name>`   |
-| Read         | `nomad-pack plan <pack> -name=<name> -diff` |
-| Update       | `nomad-pack run <pack> -name=<name>`   |
+| Create       | `nomad-pack run <pack> -name=<name>` (then `stop` too if `stopped=true`) |
+| Read         | `nomad-pack plan <pack> -name=<name> -diff` (skipped while `stopped=true`) |
+| Update       | `nomad-pack run <pack> -name=<name>`, or `nomad-pack stop <pack> -name=<name>` if `stopped=true` |
 | Delete       | `nomad-pack destroy <pack> -name=<name>` |
+
+Setting `stopped = true` stops the deployment's jobs (`nomad-pack stop`,
+without `-purge`) without forgetting it: it stays queryable and can be
+brought back by setting `stopped = false` again, which re-runs the pack.
+Use this instead of removing the resource when you want to pause a pack
+temporarily — removing the resource (`Delete`) always calls
+`nomad-pack destroy`, which purges the deployment entirely.
 
 nomad-pack's own injected job metadata (`pack.name`, `pack.version`, etc.)
 stays the single source of truth for what's deployed on the cluster — this
