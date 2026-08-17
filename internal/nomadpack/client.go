@@ -430,6 +430,26 @@ func (c *Client) Run(ctx context.Context, pack PackRef, d Deployment, detach boo
 	return res, nil
 }
 
+// isNotFoundOutput reports whether a nomad-pack failure's output indicates
+// the target job/deployment is simply already gone (e.g. reaped by
+// Nomad's garbage collector after a manual stop, or removed some other
+// way outside Terraform) rather than a real error. nomad-pack doesn't
+// document a dedicated exit code for this, and its wording isn't
+// consistent between commands — `destroy` has been seen saying "not
+// found", while `stop` says `no job(s) with prefix or id "X" found`
+// (note: no contiguous "not found" substring, so a naive check for that
+// phrase alone misses it) — so several observed phrasings are matched
+// here rather than just one.
+func isNotFoundOutput(res *Result) bool {
+	combined := strings.ToLower(res.Stderr + " " + res.Stdout)
+	for _, phrase := range []string{"not found", "no job(s)", "does not exist"} {
+		if strings.Contains(combined, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
 // Destroy stops and purges every job nomad-pack associates with this named
 // deployment, via `nomad-pack destroy` (equivalent to `stop --purge`).
 func (c *Client) Destroy(ctx context.Context, pack PackRef, d Deployment, detach bool) (*Result, error) {
@@ -450,10 +470,8 @@ func (c *Client) Destroy(ctx context.Context, pack PackRef, d Deployment, detach
 	}
 	if res.ExitCode != 0 {
 		// Deleting something already gone shouldn't fail a Terraform
-		// destroy. nomad-pack doesn't document a dedicated "not found"
-		// exit code, so this matches on stderr text as a best effort.
-		if strings.Contains(strings.ToLower(res.Stderr), "not found") ||
-			strings.Contains(strings.ToLower(res.Stdout), "not found") {
+		// destroy.
+		if isNotFoundOutput(res) {
 			return res, nil
 		}
 		return res, &CLIError{
@@ -488,6 +506,14 @@ func (c *Client) Stop(ctx context.Context, pack PackRef, d Deployment, detach bo
 		return res, err
 	}
 	if res.ExitCode != 0 {
+		// Already stopped-and-gone (e.g. Nomad's GC reaped the job since
+		// it was last stopped, whether by this provider or by hand)
+		// shouldn't fail Terraform's attempt to reconcile toward
+		// stopped=true — there's nothing left to stop, which is exactly
+		// the state being asked for.
+		if isNotFoundOutput(res) {
+			return res, nil
+		}
 		return res, &CLIError{
 			Op: "stop", Args: args, ExitCode: res.ExitCode,
 			Stdout: res.Stdout, Stderr: res.Stderr,
