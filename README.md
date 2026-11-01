@@ -93,10 +93,15 @@ doesn't need a manual `nomad-pack registry add` first (see
 - Changing `ref` adds the new ref and leaves the old one cached, so
   deployments still pinned to it keep working. `name` or `source` changes
   replace the resource.
-- Read only compares name and ref. If a registry of the same name and ref
-  was already cached from a *different* source, `registry add` skips it
-  (existing refs are never re-fetched), so remove it with
-  `nomad-pack registry delete <name> --ref=<ref>` first.
+- Creating a registry that is already in the cache is safe: `registry add`
+  with a pinned ref re-clones the source (so it needs network access to the
+  git host even when cached), leaves the packs already cached at that ref
+  untouched, and succeeds. Terraform then owns the entry, so destroying the
+  resource deletes that ref from the cache.
+- Read only compares name and ref. If the name and ref were already cached
+  from a *different* source, the cached packs are kept (not replaced) while
+  `registry list` starts showing the new source, so the mismatch is hidden.
+  Remove the entry first with `nomad-pack registry delete <name> --ref=<ref>`.
 
 ## Building locally
 
