@@ -423,32 +423,54 @@ func TestRegistryNameForSource(t *testing.T) {
 		"git@github.com:byteford/nomad-packs.git",
 		"ssh://git@example.com:2222/team/packs",
 		"/srv/git/packs with space",
+		"../..",
+		"",
 		strings.Repeat("a/", 300),
 	}
-	seen := map[string]string{}
 	for _, src := range sources {
 		name := RegistryNameForSource(src)
 		if err := ValidateRegistryName(name); err != nil {
 			t.Errorf("RegistryNameForSource(%q) = %q, not a valid registry name: %v", src, name, err)
 		}
-		if len(name) > 120 {
+		if len(name) > 100 {
 			t.Errorf("RegistryNameForSource(%q) is %d chars long", src, len(name))
 		}
 		if again := RegistryNameForSource(src); again != name {
 			t.Errorf("RegistryNameForSource(%q) not deterministic: %q then %q", src, name, again)
 		}
-		if other, dup := seen[name]; dup {
-			t.Errorf("sources %q and %q share the name %q", other, src, name)
+	}
+
+	// Readable, with no hash or other suffix.
+	if got, want := RegistryNameForSource("github.com/byteford/nomad-packs"), "github.com-byteford-nomad-packs"; got != want {
+		t.Errorf("name = %q, want %q", got, want)
+	}
+
+	// The name ends up in jobs' pack.registry meta, so every spelling of the
+	// same repository, on any machine, must give the same name or the job is
+	// restarted when Terraform runs from a machine that spells it differently.
+	same := []string{
+		"github.com/Byteford/nomad-packs",
+		"https://github.com/byteford/nomad-packs",
+		"https://github.com/byteford/nomad-packs.git",
+		"https://github.com/byteford/nomad-packs/",
+		"git::https://github.com/byteford/nomad-packs.git?ref=main",
+		"ssh://git@github.com/byteford/nomad-packs.git",
+		"https://x-access-token:secret@github.com/byteford/nomad-packs.git",
+	}
+	want := RegistryNameForSource("github.com/byteford/nomad-packs")
+	for _, src := range same {
+		if got := RegistryNameForSource(src); got != want {
+			t.Errorf("RegistryNameForSource(%q) = %q, want %q", src, got, want)
 		}
-		seen[name] = src
 	}
-	// Readable: the host and repo are visible in the name.
-	if got := RegistryNameForSource("https://github.com/byteford/nomad-packs.git"); !strings.HasPrefix(got, "github.com-byteford-nomad-packs-") {
-		t.Errorf("name %q should start with the host and repo", got)
+	// scp-style "git@host:path" flattens the same way.
+	if got := RegistryNameForSource("git@github.com:byteford/nomad-packs.git"); got != want {
+		t.Errorf("scp-style source gave %q, want %q", got, want)
 	}
-	// Different strings that slug the same must still differ.
-	if RegistryNameForSource("github.com/a/b") == RegistryNameForSource("github.com/a-b") {
-		t.Error("github.com/a/b and github.com/a-b must not collide")
+
+	// Different repositories stay different.
+	if RegistryNameForSource("github.com/byteford/a") == RegistryNameForSource("github.com/byteford/b") {
+		t.Error("different repositories must not share a name")
 	}
 }
 

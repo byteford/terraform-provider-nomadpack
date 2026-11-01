@@ -2,8 +2,6 @@ package nomadpack
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"regexp"
 	"strings"
@@ -254,12 +252,22 @@ var (
 
 // RegistryNameForSource derives the nomad-pack registry name used for a
 // deployment's registry_source. A URL can't be the name itself (nomad-pack
-// uses it as a cache directory name), so the name is a readable slug of the
-// host and path plus the first 8 hex digits of the SHA-256 of the exact
-// source string, e.g. "github.com-byteford-nomad-packs-1a2b3c4d". The suffix
-// keeps sources that slug the same ("a/b" and "a-b") apart. The result is
-// stable: it ends up in jobs' pack.registry meta, so changing this
-// function would make existing deployments look changed.
+// uses it as a cache directory name), so the name is a lower-case slug of
+// the host and path: "github.com-byteford-nomad-packs".
+//
+// The name ends up in jobs' pack.registry meta, and a meta change restarts
+// the job, so it must come out the same for every machine and every
+// spelling of one repository. The scheme, user and password, a trailing
+// ".git" or "/", a "?query", and letter case are therefore all ignored:
+// "git@github.com:Org/repo.git" and "https://github.com/org/repo" give the
+// same name. That also keeps credentials out of the name.
+//
+// Two different repositories only share a name if their host and path
+// flatten to the same text (for example "host/a/b" and "host/a-b"); the
+// first one cached under a ref then wins silently, so avoid that.
+//
+// Changing this function renames the registry of every existing
+// deployment and restarts their jobs.
 func RegistryNameForSource(source string) string {
 	s := strings.TrimSpace(source)
 	s = strings.TrimPrefix(s, "git::")
@@ -268,10 +276,11 @@ func RegistryNameForSource(source string) string {
 	}
 	s = urlScheme.ReplaceAllString(s, "")
 	if i := strings.Index(s, "@"); i >= 0 && !strings.Contains(s[:i], "/") {
-		s = s[i+1:] // user@host
+		s = s[i+1:] // user@host, user:password@host
 	}
 	s = strings.TrimRight(s, "/")
 	s = strings.TrimSuffix(s, ".git")
+	s = strings.ToLower(s)
 
 	slug := strings.Trim(nonNameChars.ReplaceAllString(s, "-"), "-.")
 	if len(slug) > maxSlugLength {
@@ -280,8 +289,7 @@ func RegistryNameForSource(source string) string {
 	if slug == "" {
 		slug = "registry"
 	}
-	sum := sha256.Sum256([]byte(source))
-	return slug + "-" + hex.EncodeToString(sum[:])[:8]
+	return slug
 }
 
 // ensureRegistry makes a pack's registry available in nomad-pack's cache
