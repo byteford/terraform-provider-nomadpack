@@ -163,6 +163,7 @@ func (p *NomadPackProvider) Configure(ctx context.Context, req provider.Configur
 func (p *NomadPackProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		NewDeploymentResource,
+		NewRegistryResource,
 	}
 }
 

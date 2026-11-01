@@ -591,6 +591,20 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 		var cliErr *nomadpack.CLIError
 		if errors.As(err, &cliErr) {
 			combined := strings.ToLower(cliErr.Output())
+
+			// A registry pack that isn't in nomad-pack's cache (e.g. the
+			// cache was wiped) makes `plan` fail with "failed to find
+			// pack" before it looks at the cluster. That says nothing
+			// about the deployment, whose jobs are still running, so keep
+			// its state untouched and let apply re-add the registry
+			// (nomadpack_registry). Aborting here would stop the refresh,
+			// and with it the recovery. Local-path packs are excluded: a
+			// missing pack directory there is a real error.
+			if state.Registry.ValueString() != "" && strings.Contains(combined, "failed to find pack") {
+				resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+				return
+			}
+
 			if strings.Contains(combined, "no jobs found") ||
 				strings.Contains(combined, "not found") ||
 				strings.Contains(combined, "does not exist") {

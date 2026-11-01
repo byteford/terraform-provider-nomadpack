@@ -71,6 +71,53 @@ Kubernetes resources.
 See `examples/provider/provider.tf` and
 `examples/resources/nomadpack_deployment/resource.tf`.
 
+### Registries
+
+`nomadpack_registry` makes sure a pack registry is in nomad-pack's cache on
+the machine running Terraform, so a `nomadpack_deployment` with `registry`/`ref`
+doesn't need a manual `nomad-pack registry add` first (see
+`examples/resources/nomadpack_registry/resource.tf`).
+
+| Terraform op | nomad-pack command |
+|---|---|
+| Create / Update (`ref` change) | `nomad-pack registry add <name> <source> --ref=<ref>` |
+| Read | `nomad-pack registry list` (entry missing => removed from state, so the next apply re-adds it, e.g. after the cache was wiped) |
+| Delete | `nomad-pack registry delete <name> --ref=<ref>` (skipped if the entry is already gone) |
+
+- `ref` is required and `""`, `latest` and `@latest` are rejected: without a
+  pinned ref `registry add` overwrites nomad-pack's cached `@latest`. Use a
+  tag or SHA. Branches can't be told apart from tags, so they aren't rejected,
+  but they aren't reproducible.
+- `name` is limited to letters, digits, `.`, `_` and `-`, starting with a
+  letter or digit: nomad-pack uses it as a directory name in its cache.
+- Registry commands run one at a time inside the provider process, because
+  nomad-pack stages every `registry add` in one shared temp directory. Two
+  Terraform runs (or provider aliases, if Terraform starts a separate
+  process for each) against the same cache are not coordinated.
+- After a wiped cache, a `nomadpack_deployment` that uses the registry keeps
+  its state on refresh (its `nomad-pack plan` fails with "failed to find
+  pack", which is treated as a cache miss, not drift) while the registry
+  resource is re-added on apply. This applies only to registry packs, not
+  local-path packs.
+- Deleting a registry that nomad-pack lists but has no packs left for (an
+  earlier ref-scoped `registry delete` leaves the entry behind) succeeds.
+  Read can't tell such an entry from a complete one: no nomad-pack command
+  shows packs per ref.
+- The cache lives on the machine running Terraform; nothing is shared with
+  other machines or CI runners.
+- Changing `ref` adds the new ref and leaves the old one cached, so
+  deployments still pinned to it keep working. `name` or `source` changes
+  replace the resource.
+- Creating a registry that is already in the cache is safe: `registry add`
+  with a pinned ref re-clones the source (so it needs network access to the
+  git host even when cached), leaves the packs already cached at that ref
+  untouched, and succeeds. Terraform then owns the entry, so destroying the
+  resource deletes that ref from the cache.
+- Read only compares name and ref. If the name and ref were already cached
+  from a *different* source, the cached packs are kept (not replaced) while
+  `registry list` starts showing the new source, so the mismatch is hidden.
+  Remove the entry first with `nomad-pack registry delete <name> --ref=<ref>`.
+
 ## Building locally
 
 ```sh
