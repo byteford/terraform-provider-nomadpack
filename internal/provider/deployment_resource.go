@@ -178,8 +178,9 @@ func (r *DeploymentResource) Schema(_ context.Context, _ resource.SchemaRequest,
 					"itself, at `ref`, before every plan, refresh, apply and destroy, and only if it is not " +
 					"cached already. That is what lets `terraform plan` preview the pack (including a new " +
 					"`ref`) before anything has been applied, and re-adds the registry after the cache is " +
-					"wiped. The registry is named after the source (a readable slug of the host and path plus " +
-					"a short hash), so deployments with the same source share one cached registry. Requires a " +
+					"wiped. The registry is named after the source (a lower-case slug of the host and path, e.g. " +
+					"`github.com-org-nomad-packs`; scheme, user and `.git` are ignored), so deployments with the " +
+					"same source share one cached registry. Requires a " +
 					"pinned `ref` (a tag or commit SHA, not empty or `latest`) and cannot be combined with " +
 					"`registry`. Fetching happens during `terraform plan`, on the machine running Terraform.",
 			},

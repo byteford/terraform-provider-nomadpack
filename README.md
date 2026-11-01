@@ -81,10 +81,12 @@ the provider checks `nomad-pack registry list` and runs
 missing, so `terraform plan` can preview a pack (or a new `ref`) before anything
 is applied, and a wiped cache is re-populated by the next plan. Notes:
 
-- The registry name is derived from the source (a slug of host and path plus an
-  8-character hash, e.g. `github.com-org-nomad-packs-1a2b3c4d`); deployments
-  with the same source share one cached registry. The name ends up in jobs'
-  `pack.registry` meta, so it is stable by design.
+- The registry name is a lower-case slug of the source's host and path
+  (`git@github.com:Org/nomad-packs.git` and `https://github.com/org/nomad-packs`
+  both give `github.com-org-nomad-packs`); deployments with the same source
+  share one cached registry. The name ends up in jobs' `pack.registry` meta, so
+  it is the same on every machine by design, and changing how it is derived
+  would restart existing jobs.
 - It cannot be combined with `registry`, and `ref` must be a tag or SHA.
 - It fetches during `terraform plan` (and refresh): plans run in CI populate
   that runner's cache, and a git failure fails the refresh of an existing
