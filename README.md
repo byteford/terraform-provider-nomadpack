@@ -71,6 +71,33 @@ Kubernetes resources.
 See `examples/provider/provider.tf` and
 `examples/resources/nomadpack_deployment/resource.tf`.
 
+### Registries
+
+`nomadpack_registry` makes sure a pack registry is in nomad-pack's cache on
+the machine running Terraform, so a `nomadpack_deployment` with `registry`/`ref`
+doesn't need a manual `nomad-pack registry add` first (see
+`examples/resources/nomadpack_registry/resource.tf`).
+
+| Terraform op | nomad-pack command |
+|---|---|
+| Create / Update (`ref` change) | `nomad-pack registry add <name> <source> --ref=<ref>` |
+| Read | `nomad-pack registry list` (entry missing => removed from state, so the next apply re-adds it, e.g. after the cache was wiped) |
+| Delete | `nomad-pack registry delete <name> --ref=<ref>` (skipped if the entry is already gone) |
+
+- `ref` is required and `""`, `latest` and `@latest` are rejected: without a
+  pinned ref `registry add` overwrites nomad-pack's cached `@latest`. Use a
+  tag or SHA. Branches can't be told apart from tags, so they aren't rejected,
+  but they aren't reproducible.
+- The cache lives on the machine running Terraform; nothing is shared with
+  other machines or CI runners.
+- Changing `ref` adds the new ref and leaves the old one cached, so
+  deployments still pinned to it keep working. `name` or `source` changes
+  replace the resource.
+- Read only compares name and ref. If a registry of the same name and ref
+  was already cached from a *different* source, `registry add` skips it
+  (existing refs are never re-fetched), so remove it with
+  `nomad-pack registry delete <name> --ref=<ref>` first.
+
 ## Building locally
 
 ```sh
