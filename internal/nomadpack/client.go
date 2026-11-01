@@ -93,6 +93,12 @@ type PackRef struct {
 	Pack     string
 	Registry string
 	Ref      string
+
+	// RegistrySource, if set, is the git URL of the registry. The registry
+	// name is then derived from it (RegistryNameForSource, overriding
+	// Registry) and the registry is added to nomad-pack's cache at Ref
+	// before any command runs; see ensureRegistry. Ref must be pinned.
+	RegistrySource string
 }
 
 // Deployment describes a single named instance of a rendered pack.
@@ -320,6 +326,9 @@ func (c *Client) exec(ctx context.Context, args []string) (*Result, error) {
 func (c *Client) Plan(ctx context.Context, pack PackRef, d Deployment) (hasChanges bool, diff string, res *Result, err error) {
 	pack = c.resolvedPackRef(pack)
 	d = c.resolvedDeployment(d)
+	if pack, err = c.ensureRegistry(ctx, pack); err != nil {
+		return false, "", nil, err
+	}
 
 	args := []string{"plan", pack.Pack, "--diff"}
 	args = append(args, packArgs(pack)...)
@@ -408,6 +417,10 @@ func filterChangedJobBlocks(output string) (changed string, anyChanged bool) {
 func (c *Client) Run(ctx context.Context, pack PackRef, d Deployment, detach bool) (*Result, error) {
 	pack = c.resolvedPackRef(pack)
 	d = c.resolvedDeployment(d)
+	pack, err := c.ensureRegistry(ctx, pack)
+	if err != nil {
+		return nil, err
+	}
 
 	args := []string{"run", pack.Pack}
 	args = append(args, packArgs(pack)...)
@@ -455,6 +468,10 @@ func isNotFoundOutput(res *Result) bool {
 func (c *Client) Destroy(ctx context.Context, pack PackRef, d Deployment, detach bool) (*Result, error) {
 	pack = c.resolvedPackRef(pack)
 	d = c.resolvedDeployment(d)
+	pack, err := c.ensureRegistry(ctx, pack)
+	if err != nil {
+		return nil, err
+	}
 
 	args := []string{"destroy", pack.Pack}
 	args = append(args, packArgs(pack)...)
@@ -492,6 +509,10 @@ func (c *Client) Destroy(ctx context.Context, pack PackRef, d Deployment, detach
 func (c *Client) Stop(ctx context.Context, pack PackRef, d Deployment, detach bool) (*Result, error) {
 	pack = c.resolvedPackRef(pack)
 	d = c.resolvedDeployment(d)
+	pack, err := c.ensureRegistry(ctx, pack)
+	if err != nil {
+		return nil, err
+	}
 
 	args := []string{"stop", pack.Pack}
 	args = append(args, packArgs(pack)...)

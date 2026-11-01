@@ -62,6 +62,8 @@ var (
 	_ resource.ResourceWithConfigure   = &DeploymentResource{}
 	_ resource.ResourceWithImportState = &DeploymentResource{}
 	_ resource.ResourceWithModifyPlan  = &DeploymentResource{}
+
+	_ resource.ResourceWithValidateConfig = &DeploymentResource{}
 )
 
 func NewDeploymentResource() resource.Resource {
@@ -134,6 +136,8 @@ type deploymentResourceModel struct {
 	Detach   types.Bool   `tfsdk:"detach"`
 	Stopped  types.Bool   `tfsdk:"stopped"`
 	DiffHash types.String `tfsdk:"diff_hash"`
+
+	RegistrySource types.String `tfsdk:"registry_source"`
 }
 
 func (r *DeploymentResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -166,6 +170,18 @@ func (r *DeploymentResource) Schema(_ context.Context, _ resource.SchemaRequest,
 			"registry": schema.StringAttribute{
 				Optional:    true,
 				Description: "Registry name containing the pack. Omit to use nomad-pack's default registry.",
+			},
+			"registry_source": schema.StringAttribute{
+				Optional: true,
+				Description: "Git URL of the registry the pack comes from, e.g. `github.com/org/nomad-packs`. " +
+					"Use this instead of `registry`: the provider adds the registry to nomad-pack's cache " +
+					"itself, at `ref`, before every plan, refresh, apply and destroy, and only if it is not " +
+					"cached already. That is what lets `terraform plan` preview the pack (including a new " +
+					"`ref`) before anything has been applied, and re-adds the registry after the cache is " +
+					"wiped. The registry is named after the source (a readable slug of the host and path plus " +
+					"a short hash), so deployments with the same source share one cached registry. Requires a " +
+					"pinned `ref` (a tag or commit SHA, not empty or `latest`) and cannot be combined with " +
+					"`registry`. Fetching happens during `terraform plan`, on the machine running Terraform.",
 			},
 			"ref": schema.StringAttribute{
 				Optional: true,
@@ -247,6 +263,40 @@ func (r *DeploymentResource) Configure(_ context.Context, req resource.Configure
 	r.runDetach = data.RunDetach
 }
 
+// ValidateConfig rejects registry_source combinations nomad-pack can't honour:
+// both it and registry, or no pinned ref. Unknown values are left to apply.
+func (r *DeploymentResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var cfg deploymentResourceModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if cfg.RegistrySource.IsNull() {
+		return
+	}
+
+	if !cfg.Registry.IsNull() {
+		resp.Diagnostics.AddAttributeError(path.Root("registry_source"),
+			"Conflicting registry settings",
+			"registry_source and registry cannot both be set: registry_source names the registry itself, "+
+				"so use registry_source for a registry the provider should add, or registry for one that "+
+				"already exists in nomad-pack's cache.")
+	}
+	if !cfg.RegistrySource.IsUnknown() {
+		if src := cfg.RegistrySource.ValueString(); strings.TrimSpace(src) == "" || strings.HasPrefix(src, "-") {
+			resp.Diagnostics.AddAttributeError(path.Root("registry_source"),
+				"Invalid registry_source",
+				"registry_source must be a git URL such as github.com/org/nomad-packs.")
+		}
+	}
+	if !cfg.Ref.IsUnknown() {
+		if err := nomadpack.ValidateRegistryRef(cfg.Ref.ValueString()); err != nil {
+			resp.Diagnostics.AddAttributeError(path.Root("ref"),
+				"registry_source requires a pinned ref", err.Error())
+		}
+	}
+}
+
 // toPackRef / toDeployment convert the Terraform model into the plain Go
 // types the nomadpack.Client understands.
 func (m *deploymentResourceModel) toPackRef() nomadpack.PackRef {
@@ -254,6 +304,8 @@ func (m *deploymentResourceModel) toPackRef() nomadpack.PackRef {
 		Pack:     m.Pack.ValueString(),
 		Registry: m.Registry.ValueString(),
 		Ref:      m.Ref.ValueString(),
+
+		RegistrySource: m.RegistrySource.ValueString(),
 	}
 }
 
@@ -351,6 +403,9 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 
 	if plan.Pack.IsUnknown() {
 		return // pack depends on another not-yet-known value; nothing to preview yet.
+	}
+	if plan.RegistrySource.IsUnknown() || (!plan.RegistrySource.IsNull() && plan.Ref.IsUnknown()) {
+		return // registry can't be fetched until these are known (at apply).
 	}
 
 	dep, err := plan.toDeployment(ctx)
@@ -474,7 +529,7 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 // ("Will redeploy" vs "Drift detected") — they no longer decide whether to
 // query nomad-pack, only whether the target changed from state.
 func packRefsEqual(a, b nomadpack.PackRef) bool {
-	return a.Pack == b.Pack && a.Registry == b.Registry && a.Ref == b.Ref
+	return a.Pack == b.Pack && a.Registry == b.Registry && a.RegistrySource == b.RegistrySource && a.Ref == b.Ref
 }
 
 func deploymentsEqual(a, b nomadpack.Deployment) bool {

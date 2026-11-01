@@ -414,3 +414,214 @@ if [ "$1 $2" = "registry list" ]; then echo 'No registries present in the cache.
 		t.Fatal("two nomad-pack registry commands ran at the same time")
 	}
 }
+
+func TestRegistryNameForSource(t *testing.T) {
+	sources := []string{
+		"github.com/byteford/nomad-packs",
+		"https://github.com/byteford/nomad-packs.git",
+		"git::https://github.com/byteford/nomad-packs.git?ref=main",
+		"git@github.com:byteford/nomad-packs.git",
+		"ssh://git@example.com:2222/team/packs",
+		"/srv/git/packs with space",
+		strings.Repeat("a/", 300),
+	}
+	seen := map[string]string{}
+	for _, src := range sources {
+		name := RegistryNameForSource(src)
+		if err := ValidateRegistryName(name); err != nil {
+			t.Errorf("RegistryNameForSource(%q) = %q, not a valid registry name: %v", src, name, err)
+		}
+		if len(name) > 120 {
+			t.Errorf("RegistryNameForSource(%q) is %d chars long", src, len(name))
+		}
+		if again := RegistryNameForSource(src); again != name {
+			t.Errorf("RegistryNameForSource(%q) not deterministic: %q then %q", src, name, again)
+		}
+		if other, dup := seen[name]; dup {
+			t.Errorf("sources %q and %q share the name %q", other, src, name)
+		}
+		seen[name] = src
+	}
+	// Readable: the host and repo are visible in the name.
+	if got := RegistryNameForSource("https://github.com/byteford/nomad-packs.git"); !strings.HasPrefix(got, "github.com-byteford-nomad-packs-") {
+		t.Errorf("name %q should start with the host and repo", got)
+	}
+	// Different strings that slug the same must still differ.
+	if RegistryNameForSource("github.com/a/b") == RegistryNameForSource("github.com/a-b") {
+		t.Error("github.com/a/b and github.com/a-b must not collide")
+	}
+}
+
+const testSource = "github.com/byteford/nomad-packs"
+
+// listBody makes the fake answer `registry list` with the derived registry
+// when it is already "cached" (marker file present) and an empty cache
+// otherwise; `registry add` creates the marker.
+func sourceFakeBody(t *testing.T, cached bool, failAdd bool) (body, marker string) {
+	t.Helper()
+	marker = filepath.Join(t.TempDir(), "cached")
+	if cached {
+		if err := os.WriteFile(marker, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	name := RegistryNameForSource(testSource)
+	add := "touch '" + marker + "'"
+	if failAdd {
+		add = "echo 'could not install registry' >&2; exit 1"
+	}
+	body = `case "$1 $2" in
+"registry list")
+  if [ -e '` + marker + `' ]; then
+    printf 'REGISTRY NAME  REF  LOCAL_REF  REGISTRY_URL\n` + name + `  v1.2.3  9f8e7d6c  ` + testSource + `\n'
+  else
+    echo 'No registries present in the cache.'
+  fi ;;
+"registry add") ` + add + ` ;;
+esac`
+	return body, marker
+}
+
+func TestPlanWithRegistrySourceAddsMissingRegistryFirst(t *testing.T) {
+	body, _ := sourceFakeBody(t, false, false)
+	bin, argLog := fakeNomadPackScript(t, body)
+	c := &Client{BinaryPath: bin}
+	name := RegistryNameForSource(testSource)
+
+	_, _, _, err := c.Plan(context.Background(),
+		PackRef{Pack: "mosquitto", RegistrySource: testSource, Ref: "v1.2.3"},
+		Deployment{Name: "mosquitto"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertEqualArgs(t, readArgLog(t, argLog), []string{
+		"registry list",
+		"registry add " + name + " " + testSource + " --ref=v1.2.3",
+		"plan mosquitto --diff --registry=" + name + " --ref=v1.2.3 --name=mosquitto",
+	})
+}
+
+func TestPlanWithRegistrySourceSkipsAddWhenCached(t *testing.T) {
+	body, _ := sourceFakeBody(t, true, false)
+	bin, argLog := fakeNomadPackScript(t, body)
+	c := &Client{BinaryPath: bin}
+	name := RegistryNameForSource(testSource)
+
+	_, _, _, err := c.Plan(context.Background(),
+		PackRef{Pack: "mosquitto", RegistrySource: testSource, Ref: "v1.2.3"},
+		Deployment{Name: "mosquitto"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertEqualArgs(t, readArgLog(t, argLog), []string{
+		"registry list",
+		"plan mosquitto --diff --registry=" + name + " --ref=v1.2.3 --name=mosquitto",
+	})
+}
+
+func TestEveryPackCommandEnsuresTheRegistry(t *testing.T) {
+	name := RegistryNameForSource(testSource)
+	pack := PackRef{Pack: "mosquitto", RegistrySource: testSource, Ref: "v1.2.3"}
+	dep := Deployment{Name: "mosquitto"}
+	ctx := context.Background()
+
+	tests := map[string]struct {
+		call func(c *Client) error
+		want string
+	}{
+		"run": {func(c *Client) error { _, err := c.Run(ctx, pack, dep, false); return err },
+			"run mosquitto --registry=" + name + " --ref=v1.2.3 --name=mosquitto"},
+		"stop": {func(c *Client) error { _, err := c.Stop(ctx, pack, dep, false); return err },
+			"stop mosquitto --registry=" + name + " --ref=v1.2.3 --name=mosquitto"},
+		"destroy": {func(c *Client) error { _, err := c.Destroy(ctx, pack, dep, false); return err },
+			"destroy mosquitto --registry=" + name + " --ref=v1.2.3 --name=mosquitto"},
+	}
+	for op, tt := range tests {
+		t.Run(op, func(t *testing.T) {
+			body, _ := sourceFakeBody(t, false, false)
+			bin, argLog := fakeNomadPackScript(t, body)
+			if err := tt.call(&Client{BinaryPath: bin}); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			got := readArgLog(t, argLog)
+			assertEqualArgs(t, got, []string{
+				"registry list",
+				"registry add " + name + " " + testSource + " --ref=v1.2.3",
+				tt.want,
+			})
+		})
+	}
+}
+
+func TestRegistrySourceAddFailureStopsBeforeNomadPackCommand(t *testing.T) {
+	body, _ := sourceFakeBody(t, false, true)
+	bin, argLog := fakeNomadPackScript(t, body)
+	c := &Client{BinaryPath: bin}
+
+	_, _, _, err := c.Plan(context.Background(),
+		PackRef{Pack: "mosquitto", RegistrySource: testSource, Ref: "v1.2.3"}, Deployment{Name: "mosquitto"})
+	if err == nil || !strings.Contains(err.Error(), "could not install registry") {
+		t.Fatalf("expected the registry add error, got %v", err)
+	}
+	for _, l := range readArgLog(t, argLog) {
+		if strings.HasPrefix(l, "plan ") {
+			t.Fatalf("plan ran although the registry could not be added: %v", readArgLog(t, argLog))
+		}
+	}
+}
+
+func TestRegistrySourceRequiresPinnedRef(t *testing.T) {
+	for _, ref := range []string{"", "latest", "@latest"} {
+		bin, argLog := fakeNomadPackScript(t, "exit 0")
+		c := &Client{BinaryPath: bin}
+		_, _, _, err := c.Plan(context.Background(),
+			PackRef{Pack: "mosquitto", RegistrySource: testSource, Ref: ref}, Deployment{Name: "mosquitto"})
+		if err == nil {
+			t.Errorf("ref %q: expected error", ref)
+		}
+		if got := readArgLog(t, argLog); len(got) != 0 {
+			t.Errorf("ref %q: nomad-pack was invoked: %v", ref, got)
+		}
+	}
+}
+
+func TestConcurrentCommandsAddTheSameRegistryOnce(t *testing.T) {
+	// Terraform refreshes deployments in parallel; deployments sharing a
+	// registry_source must not each clone it.
+	body, _ := sourceFakeBody(t, false, false)
+	bin, argLog := fakeNomadPackScript(t, body)
+	c := &Client{BinaryPath: bin}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, _, _ = c.Plan(context.Background(),
+				PackRef{Pack: "mosquitto", RegistrySource: testSource, Ref: "v1.2.3"}, Deployment{Name: "mosquitto"})
+		}()
+	}
+	wg.Wait()
+
+	adds := 0
+	for _, l := range readArgLog(t, argLog) {
+		if strings.HasPrefix(l, "registry add ") {
+			adds++
+		}
+	}
+	if adds != 1 {
+		t.Fatalf("registry add ran %d times, want 1", adds)
+	}
+}
+
+func TestPlainRegistryAndLocalPacksDoNotTouchTheCache(t *testing.T) {
+	bin, argLog := fakeNomadPackScript(t, "exit 0")
+	c := &Client{BinaryPath: bin}
+	_, _, _, _ = c.Plan(context.Background(), PackRef{Pack: "mosquitto", Registry: "homelab", Ref: "v1"}, Deployment{Name: "m"})
+	_, _, _, _ = c.Plan(context.Background(), PackRef{Pack: "/mnt/e/packs/mosquitto"}, Deployment{Name: "m"})
+	for _, l := range readArgLog(t, argLog) {
+		if strings.HasPrefix(l, "registry ") {
+			t.Fatalf("unexpected registry command: %q", l)
+		}
+	}
+}
