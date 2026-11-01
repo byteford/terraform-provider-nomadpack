@@ -39,3 +39,13 @@ resource "nomadpack_deployment" "postgres" {
 output "authentik_diff_hash" {
   value = nomadpack_deployment.authentik.diff_hash
 }
+
+# Instead of `registry`, `registry_source` lets the provider add the registry
+# to nomad-pack's cache itself, at the pinned ref, before every plan/apply.
+# `terraform plan` can then show what a new ref changes before you apply it.
+# `ref` must be a tag or commit SHA.
+resource "nomadpack_deployment" "mosquitto" {
+  pack            = "mosquitto"
+  registry_source = "github.com/byteford/nomad-packs"
+  ref             = "v1.2.3"
+}

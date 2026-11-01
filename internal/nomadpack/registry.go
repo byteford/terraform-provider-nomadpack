@@ -2,6 +2,8 @@ package nomadpack
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"regexp"
 	"strings"
@@ -81,7 +83,12 @@ func (c *Client) RegistryAdd(ctx context.Context, r Registry) (*Result, error) {
 
 	registryMu.Lock()
 	defer registryMu.Unlock()
+	return c.registryAdd(ctx, r)
+}
 
+// registryAdd is RegistryAdd for callers that already hold registryMu and
+// have validated r.
+func (c *Client) registryAdd(ctx context.Context, r Registry) (*Result, error) {
 	args := []string{"registry", "add", r.Name, r.Source, "--ref=" + r.Ref}
 	res, err := c.exec(ctx, args)
 	if err != nil {
@@ -237,4 +244,80 @@ func parseRegistryList(out string) []RegistryEntry {
 		entries = append(entries, RegistryEntry{Name: fields[0], Ref: fields[1]})
 	}
 	return entries
+}
+
+var (
+	nonNameChars  = regexp.MustCompile(`[^A-Za-z0-9._]+`)
+	urlScheme     = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*://`)
+	maxSlugLength = 100
+)
+
+// RegistryNameForSource derives the nomad-pack registry name used for a
+// deployment's registry_source. A URL can't be the name itself (nomad-pack
+// uses it as a cache directory name), so the name is a readable slug of the
+// host and path plus the first 8 hex digits of the SHA-256 of the exact
+// source string, e.g. "github.com-byteford-nomad-packs-1a2b3c4d". The suffix
+// keeps sources that slug the same ("a/b" and "a-b") apart. The result is
+// stable: it ends up in jobs' pack.registry meta, so changing this
+// function would make existing deployments look changed.
+func RegistryNameForSource(source string) string {
+	s := strings.TrimSpace(source)
+	s = strings.TrimPrefix(s, "git::")
+	if i := strings.IndexAny(s, "?#"); i >= 0 {
+		s = s[:i]
+	}
+	s = urlScheme.ReplaceAllString(s, "")
+	if i := strings.Index(s, "@"); i >= 0 && !strings.Contains(s[:i], "/") {
+		s = s[i+1:] // user@host
+	}
+	s = strings.TrimRight(s, "/")
+	s = strings.TrimSuffix(s, ".git")
+
+	slug := strings.Trim(nonNameChars.ReplaceAllString(s, "-"), "-.")
+	if len(slug) > maxSlugLength {
+		slug = strings.Trim(slug[:maxSlugLength], "-.")
+	}
+	if slug == "" {
+		slug = "registry"
+	}
+	sum := sha256.Sum256([]byte(source))
+	return slug + "-" + hex.EncodeToString(sum[:])[:8]
+}
+
+// ensureRegistry makes a pack's registry available in nomad-pack's cache
+// when the pack is configured with a RegistrySource, and returns the PackRef
+// with Registry set to the derived name. Without a RegistrySource it is a
+// no-op. Doing this before every plan/run/stop/destroy is what lets
+// `terraform plan` preview a pack from a registry (or ref) that is not in
+// the cache yet, and re-adds one after the cache was wiped.
+//
+// The registry is only added when `registry list` does not already show it,
+// so a cached registry costs no network call (and if list output were ever
+// unparseable the worst case is an extra, idempotent add). Check and add
+// happen under registryMu, so deployments that share a source clone it once.
+func (c *Client) ensureRegistry(ctx context.Context, pack PackRef) (PackRef, error) {
+	if pack.RegistrySource == "" {
+		return pack, nil
+	}
+	if err := ValidateRegistryRef(pack.Ref); err != nil {
+		return pack, fmt.Errorf("registry_source requires a pinned ref: %w", err)
+	}
+
+	pack.Registry = RegistryNameForSource(pack.RegistrySource)
+	reg := Registry{Name: pack.Registry, Source: pack.RegistrySource, Ref: pack.Ref}
+
+	registryMu.Lock()
+	defer registryMu.Unlock()
+
+	exists, err := c.registryExists(ctx, reg.Name, reg.Ref)
+	if err != nil {
+		return pack, err
+	}
+	if exists {
+		return pack, nil
+	}
+	if _, err := c.registryAdd(ctx, reg); err != nil {
+		return pack, err
+	}
+	return pack, nil
 }

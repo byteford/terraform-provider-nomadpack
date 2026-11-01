@@ -73,6 +73,29 @@ See `examples/provider/provider.tf` and
 
 ### Registries
 
+**`registry_source` on `nomadpack_deployment`** (recommended when you want plan to
+show what changes): set `registry_source = "github.com/org/nomad-packs"` and a
+pinned `ref` instead of `registry`. Before every `plan`/`run`/`stop`/`destroy`
+the provider checks `nomad-pack registry list` and runs
+`registry add <name> <source> --ref=<ref>` only if that name and ref are
+missing, so `terraform plan` can preview a pack (or a new `ref`) before anything
+is applied, and a wiped cache is re-populated by the next plan. Notes:
+
+- The registry name is derived from the source (a slug of host and path plus an
+  8-character hash, e.g. `github.com-org-nomad-packs-1a2b3c4d`); deployments
+  with the same source share one cached registry. The name ends up in jobs'
+  `pack.registry` meta, so it is stable by design.
+- It cannot be combined with `registry`, and `ref` must be a tag or SHA.
+- It fetches during `terraform plan` (and refresh): plans run in CI populate
+  that runner's cache, and a git failure fails the refresh of an existing
+  deployment. For a new deployment the plan preview warns instead
+  ("Couldn't preview nomad-pack diff") and apply reports the error.
+- Old refs are never removed from the cache; use `nomad-pack registry delete`.
+- There is no import support for the attribute: after `terraform import`, add
+  it to the config and the first plan shows the update.
+
+**`nomadpack_registry` resource**
+
 `nomadpack_registry` makes sure a pack registry is in nomad-pack's cache on
 the machine running Terraform, so a `nomadpack_deployment` with `registry`/`ref`
 doesn't need a manual `nomad-pack registry add` first (see
