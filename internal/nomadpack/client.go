@@ -83,6 +83,27 @@ type Client struct {
 	// provider's working_directory attribute) removes that ambiguity
 	// entirely rather than relying on implicit inheritance.
 	WorkingDir string
+
+	// CacheDir, if set, is passed to every nomad-pack invocation as
+	// XDG_CACHE_HOME, which moves nomad-pack's registry cache to
+	// <CacheDir>/nomad/packs. nomad-pack records the path of the pack it
+	// deployed in each job's pack.path meta, and a meta change restarts the
+	// job, so the same CacheDir on every machine that runs Terraform keeps
+	// that value (and the job) from changing when the machine does. Must be
+	// absolute. Only honoured where nomad-pack reads XDG_CACHE_HOME; see
+	// CacheDirHonoured.
+	CacheDir string
+}
+
+// CacheDirHonoured reports whether nomad-pack on the given GOOS reads
+// XDG_CACHE_HOME to place its cache. It follows os.UserCacheDir, which
+// nomad-pack uses: macOS, iOS, Windows and Plan 9 use their own locations.
+func CacheDirHonoured(goos string) bool {
+	switch goos {
+	case "darwin", "ios", "windows", "plan9":
+		return false
+	}
+	return true
 }
 
 // PackRef identifies which pack to operate on.
@@ -275,6 +296,10 @@ func (c *Client) exec(ctx context.Context, args []string) (*Result, error) {
 	// if it misdetects a TTY. Force it off so error text stays clean when
 	// surfaced through Terraform diagnostics.
 	cmd.Env = append(os.Environ(), "NO_COLOR=1")
+	if c.CacheDir != "" {
+		// Later entries win, so this overrides an inherited XDG_CACHE_HOME.
+		cmd.Env = append(cmd.Env, "XDG_CACHE_HOME="+c.CacheDir)
+	}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

@@ -33,6 +33,12 @@ provider "nomadpack" {
   # against your Terraform root, instead of depending on whatever working
   # directory Terraform happens to launch the provider subprocess with.
   working_directory = path.root
+
+  # If more than one machine (or user) runs Terraform, set this to the same
+  # absolute path everywhere. nomad-pack records the path of a registry pack
+  # in each job's `pack.path` meta, so without it, applying from a different
+  # machine changes the meta and restarts the job. Linux/Unix only.
+  cache_dir = "/var/cache/homelab"
 }
 ```
 
@@ -44,6 +50,7 @@ provider "nomadpack" {
 - `address` (String) Nomad server address. Falls back to the NOMAD_ADDR environment variable read by nomad-pack itself if unset.
 - `binary_path` (String) Path to the nomad-pack binary. Defaults to "nomad-pack" resolved from PATH.
 - `ca_cert` (String) Path to a PEM encoded CA cert to verify the Nomad server's TLS certificate.
+- `cache_dir` (String) Absolute directory under which nomad-pack keeps its registry cache, set as XDG_CACHE_HOME for every nomad-pack call (the cache ends up in `<cache_dir>/nomad/packs`). nomad-pack records the path of the pack it deployed in each job's `pack.path` meta, and a meta change restarts the job, so use the same path on every machine that runs Terraform, otherwise applying from a different machine or user restarts jobs that use a registry pack. Only takes effect on Linux and other Unix systems; nomad-pack ignores XDG_CACHE_HOME on macOS and Windows. Left unset, nomad-pack uses its default (`~/.cache/nomad/packs`). Changing it starts with an empty cache.
 - `client_cert` (String) Path to a PEM encoded client certificate for TLS authentication. Requires client_key.
 - `client_key` (String, Sensitive) Path to the unencrypted PEM encoded private key matching client_cert.
 - `namespace` (String) Nomad namespace. Falls back to NOMAD_NAMESPACE if unset.

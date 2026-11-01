@@ -71,6 +71,29 @@ Kubernetes resources.
 See `examples/provider/provider.tf` and
 `examples/resources/nomadpack_deployment/resource.tf`.
 
+### Running Terraform from more than one machine (`cache_dir`)
+
+nomad-pack stamps every job with `pack.path`, `pack.registry` and
+`pack.version` meta. For a registry pack `pack.path` is the pack's location in
+nomad-pack's cache on the machine that ran it, e.g.
+`/home/you/.cache/nomad/packs/<registry>/<ref>/<pack>@<ref>`. A meta change
+restarts the job, so applying from a second machine or user would restart every
+registry job even though nothing changed. Set `cache_dir` on the provider to the
+same absolute path everywhere (for example `/var/cache/homelab`): it is passed
+to nomad-pack as `XDG_CACHE_HOME`, so the cache lives in
+`<cache_dir>/nomad/packs` and `pack.path` is identical on every machine.
+
+- Relative paths are rejected; the directory is created by nomad-pack if
+  missing, and it must be writable by whoever runs Terraform. (Not checked
+  against a real nomad-pack.)
+- Linux and other Unix only: nomad-pack ignores `XDG_CACHE_HOME` on macOS and
+  Windows, and the provider warns.
+- Changing it starts with an empty cache; `registry_source` repopulates it on
+  the next plan. Registries you added by hand to the old location are not seen.
+- It only fixes `pack.path`. `pack.version` is the `ref`, so bumping a `ref`
+  shared by several deployments still changes all of their meta; use a ref per
+  pack if that matters.
+
 ### Registries
 
 **`registry_source` on `nomadpack_deployment`** (recommended when you want plan to

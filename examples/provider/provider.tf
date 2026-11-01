@@ -19,4 +19,10 @@ provider "nomadpack" {
   # against your Terraform root, instead of depending on whatever working
   # directory Terraform happens to launch the provider subprocess with.
   working_directory = path.root
+
+  # If more than one machine (or user) runs Terraform, set this to the same
+  # absolute path everywhere. nomad-pack records the path of a registry pack
+  # in each job's `pack.path` meta, so without it, applying from a different
+  # machine changes the meta and restarts the job. Linux/Unix only.
+  cache_dir = "/var/cache/homelab"
 }

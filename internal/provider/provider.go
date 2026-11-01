@@ -2,6 +2,9 @@ package provider
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
+	"runtime"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -38,6 +41,7 @@ type nomadPackProviderModel struct {
 	TLSServerName types.String `tfsdk:"tls_server_name"`
 	TLSSkipVerify types.Bool   `tfsdk:"tls_skip_verify"`
 	RunDetach     types.Bool   `tfsdk:"run_detach"`
+	CacheDir      types.String `tfsdk:"cache_dir"`
 }
 
 // ProviderData is what gets threaded into each resource's Configure call.
@@ -71,6 +75,17 @@ func (p *NomadPackProvider) Schema(_ context.Context, _ provider.SchemaRequest, 
 					"Relative paths in a resource's `pack` or `var_files` that look correct can still " +
 					"fail to resolve as a result. Set this to `path.root` to remove that ambiguity: " +
 					"`working_directory = path.root`.",
+			},
+			"cache_dir": schema.StringAttribute{
+				Optional: true,
+				Description: "Absolute directory under which nomad-pack keeps its registry cache, set as " +
+					"XDG_CACHE_HOME for every nomad-pack call (the cache ends up in `<cache_dir>/nomad/packs`). " +
+					"nomad-pack records the path of the pack it deployed in each job's `pack.path` meta, and a " +
+					"meta change restarts the job, so use the same path on every machine that runs Terraform, " +
+					"otherwise applying from a different machine or user restarts jobs that use a registry pack. " +
+					"Only takes effect on Linux and other Unix systems; nomad-pack ignores XDG_CACHE_HOME on " +
+					"macOS and Windows. Left unset, nomad-pack uses its default (`~/.cache/nomad/packs`). " +
+					"Changing it starts with an empty cache.",
 			},
 			"address": schema.StringAttribute{
 				Optional:    true,
@@ -149,6 +164,30 @@ func (p *NomadPackProvider) Configure(ctx context.Context, req provider.Configur
 			"client_cert was set but client_key was not. nomad-pack requires both for TLS client authentication.",
 		)
 		return
+	}
+
+	if cfg.CacheDir.IsUnknown() {
+		resp.Diagnostics.AddAttributeError(path.Root("cache_dir"),
+			"cache_dir is not known yet",
+			"cache_dir must be known when the provider is configured; it cannot depend on a resource that does not exist yet.")
+		return
+	}
+	if !cfg.CacheDir.IsNull() {
+		dir := cfg.CacheDir.ValueString()
+		if !filepath.IsAbs(dir) {
+			resp.Diagnostics.AddAttributeError(path.Root("cache_dir"),
+				"cache_dir must be an absolute path",
+				fmt.Sprintf("Got %q. A relative path would depend on the working directory, which is the "+
+					"machine-to-machine difference cache_dir exists to remove.", dir))
+			return
+		}
+		if !nomadpack.CacheDirHonoured(runtime.GOOS) {
+			resp.Diagnostics.AddAttributeWarning(path.Root("cache_dir"),
+				"cache_dir has no effect on "+runtime.GOOS,
+				"nomad-pack only reads XDG_CACHE_HOME on Linux and other Unix systems, so on "+runtime.GOOS+
+					" it keeps using its own cache location and pack.path will still differ between machines.")
+		}
+		client.CacheDir = dir
 	}
 
 	data := &ProviderData{
