@@ -73,13 +73,15 @@ func (r *RegistryResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 			"name": schema.StringAttribute{
 				Required: true,
 				Description: "Name the registry is added under; this is the value a " +
-					"`nomadpack_deployment` sets as `registry`. Changing it replaces the resource.",
+					"`nomadpack_deployment` sets as `registry`. Letters, digits, `.`, `_` and `-` only, " +
+					"starting with a letter or digit (nomad-pack uses it as a directory name). " +
+					"Changing it replaces the resource.",
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.RequiresReplace(),
 				},
 				Validators: []validator.String{
-					stringCheck("must be a non-empty name that does not start with \"-\" or contain \"/\"", func(s string) bool {
-						return s != "" && !strings.HasPrefix(s, "-") && !strings.Contains(s, "/")
+					stringCheck("must use only letters, digits, '.', '_' and '-', and start with a letter or digit", func(s string) bool {
+						return nomadpack.ValidateRegistryName(s) == nil
 					}),
 				},
 			},

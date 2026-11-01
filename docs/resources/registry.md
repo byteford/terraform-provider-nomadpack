@@ -36,7 +36,7 @@ resource "nomadpack_deployment" "mosquitto" {
 
 ### Required
 
-- `name` (String) Name the registry is added under; this is the value a `nomadpack_deployment` sets as `registry`. Changing it replaces the resource.
+- `name` (String) Name the registry is added under; this is the value a `nomadpack_deployment` sets as `registry`. Letters, digits, `.`, `_` and `-` only, starting with a letter or digit (nomad-pack uses it as a directory name). Changing it replaces the resource.
 - `ref` (String) Git tag or commit SHA to add (`--ref`). Required, and must not be empty or `latest`/`@latest`: without a pinned ref nomad-pack overwrites its cached `@latest`. Use a tag or SHA, not a branch, so applies are reproducible. Changing it adds the new ref in place and leaves the old ref cached, so deployments still pinned to it keep working.
 - `source` (String) Git URL of the registry, as accepted by `nomad-pack registry add` (e.g. `github.com/org/nomad-packs`). Changing it replaces the resource.
 

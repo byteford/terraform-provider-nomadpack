@@ -88,6 +88,21 @@ doesn't need a manual `nomad-pack registry add` first (see
   pinned ref `registry add` overwrites nomad-pack's cached `@latest`. Use a
   tag or SHA. Branches can't be told apart from tags, so they aren't rejected,
   but they aren't reproducible.
+- `name` is limited to letters, digits, `.`, `_` and `-`, starting with a
+  letter or digit: nomad-pack uses it as a directory name in its cache.
+- Registry commands run one at a time inside the provider process, because
+  nomad-pack stages every `registry add` in one shared temp directory. Two
+  Terraform runs (or provider aliases, if Terraform starts a separate
+  process for each) against the same cache are not coordinated.
+- After a wiped cache, a `nomadpack_deployment` that uses the registry keeps
+  its state on refresh (its `nomad-pack plan` fails with "failed to find
+  pack", which is treated as a cache miss, not drift) while the registry
+  resource is re-added on apply. This applies only to registry packs, not
+  local-path packs.
+- Deleting a registry that nomad-pack lists but has no packs left for (an
+  earlier ref-scoped `registry delete` leaves the entry behind) succeeds.
+  Read can't tell such an entry from a complete one: no nomad-pack command
+  shows packs per ref.
 - The cache lives on the machine running Terraform; nothing is shared with
   other machines or CI runners.
 - Changing `ref` adds the new ref and leaves the old one cached, so

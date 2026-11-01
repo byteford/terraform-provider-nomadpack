@@ -235,6 +235,11 @@ func TestRegistryAttributeValidators(t *testing.T) {
 		{"name", "", true},
 		{"name", "-homelab", true},
 		{"name", "a/b", true},
+		{"name", ".", true},
+		{"name", "..", true},
+		{"name", "a b", true},
+		{"name", "a|b", true},
+		{"name", "my_registry.v2-test", false},
 		{"source", "github.com/byteford/nomad-packs", false},
 		{"source", "", true},
 		{"source", "--ref=v1", true},
@@ -268,5 +273,105 @@ func assertCalls(t *testing.T, got, want []string) {
 		if got[i] != want[i] {
 			t.Fatalf("call %d mismatch:\n got:  %q\n want: %q", i, got, want)
 		}
+	}
+}
+
+// deploymentFixture builds a DeploymentResource over the same fake
+// nomad-pack, whose `plan` fails the way nomad-pack does when the pack is
+// not in its cache.
+func newDeploymentFixture(t *testing.T, bin string) (*DeploymentResource, resource.SchemaResponse) {
+	t.Helper()
+	d := &DeploymentResource{client: &nomadpack.Client{BinaryPath: bin}}
+	var sch resource.SchemaResponse
+	d.Schema(context.Background(), resource.SchemaRequest{}, &sch)
+	return d, sch
+}
+
+func deploymentState(t *testing.T, sch resource.SchemaResponse, pack, registry, ref string) tfsdk.State {
+	t.Helper()
+	reg := types.StringNull()
+	if registry != "" {
+		reg = types.StringValue(registry)
+	}
+	m := &deploymentResourceModel{
+		ID:       types.StringValue("mosquitto"),
+		Pack:     types.StringValue(pack),
+		Registry: reg,
+		Ref:      types.StringValue(ref),
+		Name:     types.StringValue("mosquitto"),
+		Vars:     types.MapNull(types.StringType),
+		VarFiles: types.ListNull(types.StringType),
+		Detach:   types.BoolNull(),
+		Stopped:  types.BoolValue(false),
+		DiffHash: types.StringValue("abc123"),
+	}
+	s := tfsdk.State{Schema: sch.Schema}
+	if diags := s.Set(context.Background(), m); diags.HasError() {
+		t.Fatalf("building state: %v", diags)
+	}
+	return s
+}
+
+const planPackMissing = `echo 'Failed To Find Pack' ; echo '  Error: stat /home/x/.cache/nomad-pack/homelab/v1.2.3/mosquitto@v1.2.3: no such file or directory'; exit 255`
+
+// With a wiped nomad-pack cache and both resources already in state, refresh
+// must not abort on the deployment, otherwise the registry is never
+// re-added: the registry drops out of state, the deployment keeps its state
+// (the jobs are still on the cluster), and apply recreates the registry.
+func TestWipedCacheRefreshKeepsDeploymentAndDropsRegistry(t *testing.T) {
+	script := "#!/bin/sh\n" +
+		"if [ \"$1 $2\" = \"registry list\" ]; then echo 'No registries present in the cache.'; exit 0; fi\n" +
+		"if [ \"$1\" = \"plan\" ]; then " + planPackMissing + "; fi\nexit 0\n"
+	bin := filepath.Join(t.TempDir(), "nomad-pack")
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Registry resource: removed from state.
+	rr := &RegistryResource{client: &nomadpack.Client{BinaryPath: bin}}
+	var rsch resource.SchemaResponse
+	rr.Schema(context.Background(), resource.SchemaRequest{}, &rsch)
+	rm := homelabModel("v1.2.3")
+	rm.ID = types.StringValue("homelab")
+	rst := tfsdk.State{Schema: rsch.Schema}
+	rst.Set(context.Background(), rm)
+	rresp := &resource.ReadResponse{State: rst}
+	rr.Read(context.Background(), resource.ReadRequest{State: rst}, rresp)
+	if rresp.Diagnostics.HasError() || !rresp.State.Raw.IsNull() {
+		t.Fatalf("registry: want removed from state without error, got err=%v null=%v", rresp.Diagnostics, rresp.State.Raw.IsNull())
+	}
+
+	// Deployment resource: refresh survives and keeps its state.
+	d, dsch := newDeploymentFixture(t, bin)
+	dst := deploymentState(t, dsch, "mosquitto", "homelab", "v1.2.3")
+	dresp := &resource.ReadResponse{State: dst}
+	d.Read(context.Background(), resource.ReadRequest{State: dst}, dresp)
+	if dresp.Diagnostics.HasError() {
+		t.Fatalf("deployment refresh must not fail when the registry pack is missing from the cache: %v", dresp.Diagnostics)
+	}
+	if dresp.State.Raw.IsNull() {
+		t.Fatal("deployment must stay in state: its jobs are still on the cluster")
+	}
+	var got deploymentResourceModel
+	dresp.State.Get(context.Background(), &got)
+	if got.DiffHash.ValueString() != "abc123" {
+		t.Fatalf("diff_hash changed to %q; it must be left as it was", got.DiffHash.ValueString())
+	}
+}
+
+func TestDeploymentRefreshStillFailsForMissingLocalPack(t *testing.T) {
+	// A local-path pack that vanished is a real error, not a cache miss the
+	// registry resource can repair.
+	script := "#!/bin/sh\n" + planPackMissing + "\n"
+	bin := filepath.Join(t.TempDir(), "nomad-pack")
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	d, dsch := newDeploymentFixture(t, bin)
+	dst := deploymentState(t, dsch, "/mnt/e/packs/mosquitto", "", "")
+	resp := &resource.ReadResponse{State: dst}
+	d.Read(context.Background(), resource.ReadRequest{State: dst}, resp)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected an error for a missing local pack")
 	}
 }
